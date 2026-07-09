@@ -1,0 +1,2 @@
+# Isolated release-signing GnuPG home (secret key material; never commit)
+.gnupg-release/
