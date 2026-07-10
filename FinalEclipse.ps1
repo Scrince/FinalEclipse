@@ -1,4 +1,4 @@
-[CmdletBinding()]
+[CmdletBinding(SupportsShouldProcess = $true)]
 param(
     [switch]$Monitor,
     [int]$IntervalSeconds = 5,
@@ -6,7 +6,8 @@ param(
     [switch]$UninstallTask,
     [switch]$AdvancedHarden,
     [switch]$DriftReport,
-    [switch]$TaskHealth
+    [switch]$TaskHealth,
+    [switch]$RestoreLatestBackup
 )
 
 Set-StrictMode -Version Latest
@@ -26,6 +27,8 @@ if (-not (Test-IsAdmin)) {
     if ($AdvancedHarden)  { $argList += '-AdvancedHarden' }
     if ($DriftReport)     { $argList += '-DriftReport' }
     if ($TaskHealth)      { $argList += '-TaskHealth' }
+    if ($RestoreLatestBackup) { $argList += '-RestoreLatestBackup' }
+    if ($WhatIfPreference) { $argList += '-WhatIf' }
     if ($PSBoundParameters.ContainsKey('IntervalSeconds')) {
         $argList += @('-IntervalSeconds', "$IntervalSeconds")
     }
@@ -54,8 +57,10 @@ $script:SuppressUiLog = $false
 $script:LogRateLimit = @{}
 $script:Mutex = $null
 $script:MutexName = 'Global\FinalEclipse-Monitor-Singleton'
+$script:LogMutexName = 'Global\FinalEclipse-Log-Writer'
 $script:txtLog = $null
 $script:WatchdogBusy = $false
+$script:MonitorProcess = $null
 $script:MaxLogBytes = 2MB
 $script:MaxUiLogChars = 120000
 
@@ -97,6 +102,34 @@ function Ensure-AppDirs {
     }
 }
 
+function Invoke-WithNamedMutex {
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][scriptblock]$Action,
+        [int]$TimeoutMs = 3000
+    )
+    $m = $null
+    $owned = $false
+    try {
+        $created = $false
+        $m = New-Object System.Threading.Mutex($false, $Name, [ref]$created)
+        try {
+            $owned = $m.WaitOne($TimeoutMs)
+        } catch [System.Threading.AbandonedMutexException] {
+            $owned = $true
+        }
+        if (-not $owned) { throw "Timed out waiting for mutex $Name" }
+        & $Action
+    } finally {
+        if ($owned -and $null -ne $m) {
+            try { $m.ReleaseMutex() | Out-Null } catch { }
+        }
+        if ($null -ne $m) {
+            try { $m.Dispose() } catch { }
+        }
+    }
+}
+
 function Invoke-LogRotation {
     try {
         if (-not (Test-Path -LiteralPath $script:LogFile)) { return }
@@ -110,6 +143,15 @@ function Invoke-LogRotation {
             Select-Object -Skip 5 |
             Remove-Item -Force -ErrorAction SilentlyContinue
     } catch { }
+}
+
+function Add-LogLine {
+    param([Parameter(Mandatory)][string]$Line)
+    Invoke-WithNamedMutex -Name $script:LogMutexName -Action {
+        Ensure-AppDirs
+        Invoke-LogRotation
+        Add-Content -LiteralPath $script:LogFile -Value $Line -Encoding UTF8 -ErrorAction Stop
+    } -TimeoutMs 2000
 }
 
 function Write-AppLog {
@@ -132,10 +174,10 @@ function Write-AppLog {
     $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
     $line = "[$ts] [$Level] $Message"
     try {
-        Ensure-AppDirs
-        Invoke-LogRotation
-        Add-Content -LiteralPath $script:LogFile -Value $line -Encoding UTF8 -ErrorAction SilentlyContinue
-    } catch { }
+        Add-LogLine -Line $line
+    } catch {
+        Write-Verbose "Log write failed: $($_.Exception.Message)"
+    }
 
     if ($script:SuppressUiLog) {
         Write-Host $line
@@ -176,8 +218,8 @@ function Test-EnterMonitorMutex {
         $script:Mutex = $m
         return $true
     } catch {
-        Write-AppLog "Mutex acquire failed (continuing without singleton): $($_.Exception.Message)" 'WARN'
-        return $true
+        Write-AppLog "Mutex acquire failed; monitor will not start: $($_.Exception.Message)" 'ERROR'
+        return $false
     }
 }
 
@@ -244,6 +286,10 @@ function Get-SafeRegValue {
 
 function Set-DwordPolicy {
     param([string]$Path, [string]$Name, [int]$Value)
+    if ($WhatIfPreference) {
+        Write-AppLog "WhatIf: would set $Path\$Name to $Value"
+        return
+    }
     if (-not (Test-Path -LiteralPath $Path)) {
         New-Item -Path $Path -Force | Out-Null
     }
@@ -300,6 +346,8 @@ function Get-MonitorTaskHealth {
             Enabled = $false
             RunLevel = 'n/a'
             Action = ''
+            TriggerOk = $false
+            SettingsOk = $false
             Healthy = $false
             Summary = 'Not installed'
         }
@@ -309,15 +357,32 @@ function Get-MonitorTaskHealth {
         "$($_.Execute) $($_.Arguments)"
     })
     $actionText = ($actions -join ' ; ')
-    $healthy = ($task.State -ne 'Disabled' -and
-        $actionText -match [regex]::Escape($PSCommandPath) -and
-        $actionText -match '-Monitor')
+    $hasMonitorAction = ($actionText -match [regex]::Escape($PSCommandPath) -and $actionText -match '-Monitor')
+    $triggerOk = $false
+    foreach ($trigger in @($task.Triggers)) {
+        $className = ''
+        if ($null -ne $trigger -and $null -ne $trigger.CimClass) {
+            $className = [string]$trigger.CimClass.CimClassName
+        }
+        if ($className -match 'LogonTrigger') {
+            $triggerOk = $true
+            break
+        }
+    }
+    $settingsOk = $false
+    if ($null -ne $task.Settings) {
+        $settingsOk = ([string]$task.Settings.MultipleInstances -eq 'IgnoreNew' -and [int]$task.Settings.RestartCount -ge 1)
+    }
+    $runLevelOk = ([string]$task.Principal.RunLevel -eq 'Highest')
+    $healthy = ($task.State -ne 'Disabled' -and $hasMonitorAction -and $triggerOk -and $settingsOk -and $runLevelOk)
 
     return [pscustomobject]@{
         Installed = $true
         Enabled = ($task.State -ne 'Disabled')
         RunLevel = [string]$task.Principal.RunLevel
         Action = $actionText
+        TriggerOk = $triggerOk
+        SettingsOk = $settingsOk
         Healthy = $healthy
         Summary = if ($healthy) { 'Installed and points to this script' } else { 'Installed but needs review' }
     }
@@ -469,6 +534,10 @@ function Disable-ServiceRecovery {
     if (-not $svc) { return $false }
 
     $changed = $false
+    if ($WhatIfPreference) {
+        Write-AppLog "WhatIf: would clear service recovery actions for $Name"
+        return $true
+    }
     try {
         $out = & sc.exe failure "$Name" reset= 0 actions= "" 2>&1
         if ($LASTEXITCODE -eq 0) { $changed = $true }
@@ -487,6 +556,38 @@ function Disable-ServiceRecovery {
     return $changed
 }
 
+function Invoke-ExternalCommand {
+    param(
+        [Parameter(Mandatory)][string]$FilePath,
+        [Parameter(Mandatory)][string[]]$Arguments
+    )
+    $output = & $FilePath @Arguments 2>&1
+    return [pscustomobject]@{
+        ExitCode = $LASTEXITCODE
+        Output = (($output | ForEach-Object { "$_" }) -join "`n").Trim()
+    }
+}
+
+function Wait-ServiceStableState {
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [switch]$NeedStopped,
+        [switch]$NeedDisabled,
+        [int]$TimeoutSeconds = 12
+    )
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $last = $null
+    do {
+        $last = Get-Service -Name $Name -ErrorAction SilentlyContinue
+        if ($null -eq $last) { return $null }
+        $stoppedOk = (-not $NeedStopped) -or $last.Status -eq 'Stopped'
+        $disabledOk = (-not $NeedDisabled) -or $last.StartType -eq [System.ServiceProcess.ServiceStartMode]::Disabled
+        if ($stoppedOk -and $disabledOk) { return $last }
+        Start-Sleep -Milliseconds 250
+    } while ((Get-Date) -lt $deadline)
+    return $last
+}
+
 function Disable-ServiceHard {
     param([string]$Name, [switch]$Quiet)
     $svc = Get-Service -Name $Name -ErrorAction SilentlyContinue
@@ -499,22 +600,37 @@ function Disable-ServiceHard {
     }
 
     if ($neededStop) {
-        try {
-            Stop-Service -Name $Name -Force -ErrorAction Stop
-        } catch {
-            & sc.exe stop "$Name" 2>$null | Out-Null
+        if ($WhatIfPreference) {
+            Write-AppLog "WhatIf: would stop service $Name"
+        } else {
+            try {
+                Stop-Service -Name $Name -Force -ErrorAction Stop
+            } catch {
+                $r = Invoke-ExternalCommand -FilePath 'sc.exe' -Arguments @('stop', $Name)
+                if ($r.ExitCode -ne 0) {
+                    Write-AppLog "sc.exe stop failed for ${Name} (exit $($r.ExitCode)): $($r.Output)" 'WARN' -RateLimitTicks 24
+                }
+            }
         }
-        Start-Sleep -Milliseconds 250
     }
     if ($neededDisable) {
-        try {
-            Set-Service -Name $Name -StartupType Disabled -ErrorAction Stop
-        } catch {
-            & sc.exe config "$Name" start= disabled 2>$null | Out-Null
+        if ($WhatIfPreference) {
+            Write-AppLog "WhatIf: would disable service $Name"
+        } else {
+            try {
+                Set-Service -Name $Name -StartupType Disabled -ErrorAction Stop
+            } catch {
+                $r = Invoke-ExternalCommand -FilePath 'sc.exe' -Arguments @('config', $Name, 'start=', 'disabled')
+                if ($r.ExitCode -ne 0) {
+                    Write-AppLog "sc.exe config failed for ${Name} (exit $($r.ExitCode)): $($r.Output)" 'WARN' -RateLimitTicks 24
+                }
+            }
         }
     }
 
-    $after = Get-Service -Name $Name -ErrorAction SilentlyContinue
+    if ($WhatIfPreference) { return $true }
+
+    $after = Wait-ServiceStableState -Name $Name -NeedStopped:$neededStop -NeedDisabled:$neededDisable
     if (-not $after) { return $false }
     $nowStopped  = ($after.Status -eq 'Stopped' -or $after.Status -eq 'StopPending')
     $nowDisabled = ($after.StartType -eq [System.ServiceProcess.ServiceStartMode]::Disabled)
@@ -542,6 +658,8 @@ function Export-RegistryBackup {
     $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
     $dir = Join-Path $script:BackupRoot $stamp
     New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    $failed = @()
+    $exported = @()
 
     $exports = @(
         @{ File = 'IdentityCRL.reg'; Path = 'HKCU\SOFTWARE\Microsoft\IdentityCRL' },
@@ -551,24 +669,68 @@ function Export-RegistryBackup {
 
     foreach ($e in $exports) {
         $out = Join-Path $dir $e.File
+        if (-not (Test-Path -LiteralPath ("Registry::{0}" -f $e.Path))) {
+            Write-AppLog "Backup source absent, skipped: $($e.Path)"
+            continue
+        }
         try {
             $p = Start-Process -FilePath 'reg.exe' -ArgumentList @('export', $e.Path, $out, '/y') -Wait -PassThru -WindowStyle Hidden
             if ($null -ne $p -and $p.ExitCode -eq 0) {
                 Write-AppLog "Backed up $($e.Path) -> $out"
+                $exported += $out
             } else {
                 $code = if ($null -ne $p) { $p.ExitCode } else { 'n/a' }
                 Write-AppLog "Backup skipped/failed for $($e.Path) (exit $code)" 'WARN'
+                $failed += $e.Path
             }
         } catch {
             Write-AppLog "Backup error for $($e.Path): $($_.Exception.Message)" 'WARN'
+            $failed += $e.Path
         }
     }
 
     $snap = Get-GdidSnapshot
     $snapPath = Join-Path $dir 'snapshot.txt'
-    Format-SnapshotText -Snap $snap | Set-Content -Path $snapPath -Encoding UTF8
-    Write-AppLog "Snapshot written: $snapPath"
-    return $dir
+    try {
+        Format-SnapshotText -Snap $snap | Set-Content -LiteralPath $snapPath -Encoding UTF8 -ErrorAction Stop
+        Write-AppLog "Snapshot written: $snapPath"
+    } catch {
+        Write-AppLog "Snapshot backup failed: $($_.Exception.Message)" 'ERROR'
+        $failed += 'snapshot.txt'
+    }
+    return [pscustomobject]@{
+        Path = $dir
+        Success = ($failed.Count -eq 0)
+        Exported = $exported
+        Failed = $failed
+    }
+}
+
+function Restore-LatestRegistryBackup {
+    Ensure-AppDirs
+    $latest = Get-ChildItem -LiteralPath $script:BackupRoot -Directory -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending |
+        Select-Object -First 1
+    if ($null -eq $latest) {
+        throw "No backup folders found under $script:BackupRoot"
+    }
+    $files = @(Get-ChildItem -LiteralPath $latest.FullName -Filter '*.reg' -File -ErrorAction SilentlyContinue)
+    if ($files.Count -eq 0) {
+        throw "Latest backup has no .reg files: $($latest.FullName)"
+    }
+    foreach ($f in $files) {
+        if ($WhatIfPreference) {
+            Write-AppLog "WhatIf: would import registry backup $($f.FullName)"
+            continue
+        }
+        $p = Start-Process -FilePath 'reg.exe' -ArgumentList @('import', $f.FullName) -Wait -PassThru -WindowStyle Hidden
+        if ($null -eq $p -or $p.ExitCode -ne 0) {
+            $code = if ($null -ne $p) { $p.ExitCode } else { 'n/a' }
+            throw "reg.exe import failed for $($f.FullName) (exit $code)"
+        }
+        Write-AppLog "Restored registry backup: $($f.FullName)"
+    }
+    return $latest.FullName
 }
 
 function Invoke-AssertPrivacyPolicies {
@@ -577,7 +739,11 @@ function Invoke-AssertPrivacyPolicies {
     Set-DwordPolicy -Path $ActivityHistory -Name 'UploadUserActivities' -Value 0
     Set-DwordPolicy -Path $DiagTrackPolicy -Name 'AllowTelemetry' -Value 1
     Set-DwordPolicy -Path $AdvertisingId -Name 'Enabled' -Value 0
-    Remove-ItemProperty -LiteralPath $AdvertisingId -Name 'Id' -ErrorAction SilentlyContinue
+    if ($WhatIfPreference) {
+        Write-AppLog "WhatIf: would remove $AdvertisingId\Id"
+    } else {
+        Remove-ItemProperty -LiteralPath $AdvertisingId -Name 'Id' -ErrorAction SilentlyContinue
+    }
 }
 
 function Invoke-DisableGdidPipeline {
@@ -611,9 +777,13 @@ function Disable-KnownTelemetryTasks {
         $task = Get-ScheduledTask -TaskPath $parts.TaskPath -TaskName $parts.TaskName -ErrorAction SilentlyContinue
         if ($null -eq $task -or $task.State -eq 'Disabled') { continue }
         try {
-            Disable-ScheduledTask -TaskPath $parts.TaskPath -TaskName $parts.TaskName -ErrorAction Stop | Out-Null
+            if ($WhatIfPreference) {
+                Write-AppLog "WhatIf: would disable known telemetry task: $full"
+            } else {
+                Disable-ScheduledTask -TaskPath $parts.TaskPath -TaskName $parts.TaskName -ErrorAction Stop | Out-Null
+                if (-not $Quiet) { Write-AppLog "Disabled known telemetry task: $full" }
+            }
             $changed++
-            if (-not $Quiet) { Write-AppLog "Disabled known telemetry task: $full" }
         } catch {
             Write-AppLog "Could not disable task $full`: $($_.Exception.Message)" 'WARN'
         }
@@ -640,6 +810,8 @@ function Format-TaskHealthText {
     [void]$sb.AppendLine("Installed: $($h.Installed)")
     [void]$sb.AppendLine("Enabled:   $($h.Enabled)")
     [void]$sb.AppendLine("RunLevel:  $($h.RunLevel)")
+    [void]$sb.AppendLine("TriggerOk: $($h.TriggerOk)")
+    [void]$sb.AppendLine("SettingsOk:$($h.SettingsOk)")
     [void]$sb.AppendLine("Healthy:   $($h.Healthy)")
     if ($h.Action) {
         [void]$sb.AppendLine("Action:    $($h.Action)")
@@ -675,7 +847,19 @@ function Write-DriftBaseline {
         Created = (Get-Date).ToString('o')
         Snapshot = (Convert-SnapshotForDrift -Snap $Snap)
     }
-    $body | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $script:DriftPath -Encoding UTF8
+    Invoke-WithNamedMutex -Name 'Global\FinalEclipse-State-Writer' -Action {
+        $tmp = Join-Path $script:StateDir ("last-snapshot.{0}.tmp" -f ([guid]::NewGuid().ToString('N')))
+        try {
+            $json = $body | ConvertTo-Json -Depth 5
+            $null = $json | ConvertFrom-Json -ErrorAction Stop
+            $json | Set-Content -LiteralPath $tmp -Encoding UTF8 -ErrorAction Stop
+            Move-Item -LiteralPath $tmp -Destination $script:DriftPath -Force -ErrorAction Stop
+        } finally {
+            if (Test-Path -LiteralPath $tmp) {
+                Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
 }
 
 function Format-DriftReport {
@@ -747,7 +931,11 @@ function Invoke-ClearLocalCaches {
 
     if (Test-Path -LiteralPath $IrisServiceKey) {
         try {
-            Remove-Item -LiteralPath $IrisServiceKey -Recurse -Force -ErrorAction Stop
+            if ($WhatIfPreference) {
+                Write-AppLog "WhatIf: would remove IrisService registry tree: $IrisServiceKey"
+            } else {
+                Remove-Item -LiteralPath $IrisServiceKey -Recurse -Force -ErrorAction Stop
+            }
             $did = $true
             if ($Quiet) { Write-AppLog 'Monitor: erased IrisService cache' 'WARN' -RateLimitTicks 6 }
             else { Write-AppLog 'Removed IrisService registry tree.' }
@@ -758,7 +946,11 @@ function Invoke-ClearLocalCaches {
 
     if (Test-Path -LiteralPath $CDPLocal) {
         try {
-            Remove-Item -LiteralPath $CDPLocal -Recurse -Force -ErrorAction Stop
+            if ($WhatIfPreference) {
+                Write-AppLog "WhatIf: would remove CDP local folder: $CDPLocal"
+            } else {
+                Remove-Item -LiteralPath $CDPLocal -Recurse -Force -ErrorAction Stop
+            }
             $did = $true
             if ($Quiet) { Write-AppLog 'Monitor: erased CDP local folder' 'WARN' -RateLimitTicks 6 }
             else { Write-AppLog "Removed $CDPLocal" }
@@ -780,10 +972,18 @@ function Invoke-WipeLocalDevicePuid {
     if (Test-Path -LiteralPath $IdentityExtProps) {
         foreach ($name in @('LID', 'DeviceId', 'GlobalDeviceId')) {
             if ($null -ne (Get-SafeRegValue -Path $IdentityExtProps -Name $name)) {
-                Remove-ItemProperty -LiteralPath $IdentityExtProps -Name $name -ErrorAction SilentlyContinue
-                $did = $true
-                if ($Quiet) { Write-AppLog "Monitor: wiped ExtendedProperties\$name" 'WARN' -RateLimitTicks 6 }
-                else { Write-AppLog "Removed ExtendedProperties\$name" }
+                try {
+                    if ($WhatIfPreference) {
+                        Write-AppLog "WhatIf: would remove $IdentityExtProps\$name"
+                    } else {
+                        Remove-ItemProperty -LiteralPath $IdentityExtProps -Name $name -ErrorAction Stop
+                    }
+                    $did = $true
+                    if ($Quiet) { Write-AppLog "Monitor: wiped ExtendedProperties\$name" 'WARN' -RateLimitTicks 6 }
+                    else { Write-AppLog "Removed ExtendedProperties\$name" }
+                } catch {
+                    Write-AppLog "Could not remove ExtendedProperties\${name}: $($_.Exception.Message)" 'WARN' -RateLimitTicks 12
+                }
             }
         }
     }
@@ -792,10 +992,18 @@ function Invoke-WipeLocalDevicePuid {
         Get-ChildItem -LiteralPath $IdentityImmersive -ErrorAction SilentlyContinue | ForEach-Object {
             foreach ($name in @('DeviceId', 'LID')) {
                 if ($null -ne (Get-SafeRegValue -Path $_.PSPath -Name $name)) {
-                    Remove-ItemProperty -LiteralPath $_.PSPath -Name $name -ErrorAction SilentlyContinue
-                    $did = $true
-                    if ($Quiet) { Write-AppLog "Monitor: wiped token $name under $($_.PSChildName)" 'WARN' -RateLimitTicks 6 }
-                    else { Write-AppLog "Removed $name under $($_.PSChildName)" }
+                    try {
+                        if ($WhatIfPreference) {
+                            Write-AppLog "WhatIf: would remove $($_.PSPath)\$name"
+                        } else {
+                            Remove-ItemProperty -LiteralPath $_.PSPath -Name $name -ErrorAction Stop
+                        }
+                        $did = $true
+                        if ($Quiet) { Write-AppLog "Monitor: wiped token $name under $($_.PSChildName)" 'WARN' -RateLimitTicks 6 }
+                        else { Write-AppLog "Removed $name under $($_.PSChildName)" }
+                    } catch {
+                        Write-AppLog "Could not remove token $name under $($_.PSChildName): $($_.Exception.Message)" 'WARN' -RateLimitTicks 12
+                    }
                 }
             }
         }
@@ -810,7 +1018,11 @@ function Invoke-WipeLocalDevicePuid {
                 foreach ($name in @('DeviceId', 'LID', 'GlobalDeviceId')) {
                     $matched = @($props.PSObject.Properties.Match([string]$name))
                     if ($matched.Count -lt 1 -or $null -eq $matched[0].Value) { continue }
-                    Remove-ItemProperty -LiteralPath $_.PSPath -Name $name -ErrorAction SilentlyContinue
+                    if ($WhatIfPreference) {
+                        Write-AppLog "WhatIf: would remove $($_.PSPath)\$name"
+                    } else {
+                        Remove-ItemProperty -LiteralPath $_.PSPath -Name $name -ErrorAction Stop
+                    }
                     $did = $true
                     if ($Quiet) { Write-AppLog "Monitor: wiped IdentityStore $name" 'WARN' -RateLimitTicks 6 }
                     else { Write-AppLog "Cleared IdentityStore $name" }
@@ -826,7 +1038,11 @@ function Invoke-WipeLocalDevicePuid {
 }
 
 function Invoke-FullHarden {
-    $null = Export-RegistryBackup
+    $backup = Export-RegistryBackup
+    if (-not $backup.Success) {
+        $failed = ($backup.Failed -join ', ')
+        throw "Full harden stopped because backup was incomplete. Backup folder: $($backup.Path). Failed: $failed"
+    }
     Invoke-DisableGdidPipeline
     Invoke-AdvancedHardening
     Invoke-ClearLocalCaches | Out-Null
@@ -895,15 +1111,32 @@ function Install-MonitorTask {
         -ExecutionTimeLimit ([TimeSpan]::Zero) `
         -MultipleInstances IgnoreNew
 
+    if ($WhatIfPreference) {
+        Write-AppLog "WhatIf: would register scheduled task '$($script:TaskName)' for $userId"
+        return
+    }
     Unregister-ScheduledTask -TaskName $script:TaskName -Confirm:$false -ErrorAction SilentlyContinue
     Register-ScheduledTask -TaskName $script:TaskName -Action $action -Trigger $trigger `
-        -Principal $principal -Settings $settings -Force | Out-Null
+        -Principal $principal -Settings $settings -Force -ErrorAction Stop | Out-Null
+    $health = Get-MonitorTaskHealth
+    if (-not $health.Healthy) {
+        throw "Scheduled task '$($script:TaskName)' installed but failed health validation: $($health.Summary)"
+    }
     Write-AppLog "Scheduled task '$($script:TaskName)' installed for $userId (AtLogOn, elevated, monitor mode)."
 }
 
 function Uninstall-MonitorTask {
-    Unregister-ScheduledTask -TaskName $script:TaskName -Confirm:$false -ErrorAction SilentlyContinue
-    Write-AppLog "Scheduled task '$($script:TaskName)' removed (if it existed)."
+    if ($WhatIfPreference) {
+        Write-AppLog "WhatIf: would unregister scheduled task '$($script:TaskName)'"
+        return
+    }
+    $task = Get-ScheduledTask -TaskName $script:TaskName -ErrorAction SilentlyContinue
+    if ($null -eq $task) {
+        Write-AppLog "Scheduled task '$($script:TaskName)' was not installed."
+        return
+    }
+    Unregister-ScheduledTask -TaskName $script:TaskName -Confirm:$false -ErrorAction Stop
+    Write-AppLog "Scheduled task '$($script:TaskName)' removed."
 }
 
 if ($UninstallTask) {
@@ -925,6 +1158,19 @@ if ($TaskHealth) {
     $script:SuppressUiLog = $true
     Write-Host (Format-TaskHealthText)
     exit 0
+}
+
+if ($RestoreLatestBackup) {
+    Ensure-AppDirs
+    $script:SuppressUiLog = $true
+    try {
+        $restored = Restore-LatestRegistryBackup
+        Write-Host "Restored latest registry backup: $restored"
+        exit 0
+    } catch {
+        Write-AppLog "Restore failed: $($_.Exception.Message)" 'ERROR'
+        exit 1
+    }
 }
 
 if ($DriftReport) {
@@ -1039,6 +1285,12 @@ function Refresh-SnapshotUi {
 }
 
 function Update-MonitorStatusUi {
+    if ($null -ne $script:MonitorProcess -and $script:MonitorProcess.HasExited) {
+        Write-AppLog "Owned monitor process exited with code $($script:MonitorProcess.ExitCode)." 'WARN' -RateLimitTicks 1
+        $script:MonitorProcess.Dispose()
+        $script:MonitorProcess = $null
+        $script:MonitorRunning = $false
+    }
     if ($script:MonitorRunning) {
         $lblStatus.Text = "Monitor: RUNNING (every ${IntervalSeconds}s) - blocking service restarts + erasing reappearing GDID local values"
         $lblStatus.ForeColor = [System.Drawing.Color]::DarkGreen
@@ -1056,10 +1308,10 @@ $watchTimer = New-Object System.Windows.Forms.Timer
 $watchTimer.Interval = [Math]::Max(2000, $IntervalSeconds * 1000)
 $watchTimer.Add_Tick({
     try {
-        $n = Invoke-WatchdogTick
-        if ($n -gt 0) { Refresh-SnapshotUi }
+        Update-MonitorStatusUi
+        if ($script:MonitorRunning) { Refresh-SnapshotUi }
     } catch {
-        Write-AppLog "Watchdog error: $($_.Exception.Message)" 'ERROR'
+        Write-AppLog "Monitor status refresh error: $($_.Exception.Message)" 'ERROR'
     }
 })
 
@@ -1095,15 +1347,26 @@ $btnFull = New-ActionButton -Text 'Full harden' -X 792 -Y 348 -W 120 -OnClick {
 
 $btnStartMon = New-ActionButton -Text 'Start live monitor' -X 12 -Y 382 -W 170 -OnClick {
     try {
-        if (-not (Test-EnterMonitorMutex)) {
+        if ($null -ne $script:MonitorProcess -and -not $script:MonitorProcess.HasExited) { return }
+        $argList = @('-NoProfile', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass',
+            '-File', "`"$PSCommandPath`"", '-Monitor', '-IntervalSeconds', "$IntervalSeconds")
+        if ($WhatIfPreference) { $argList += '-WhatIf' }
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = 'powershell.exe'
+        $psi.Arguments = ($argList -join ' ')
+        $psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
+        $psi.UseShellExecute = $true
+        $script:MonitorProcess = [Diagnostics.Process]::Start($psi)
+        Start-Sleep -Milliseconds 800
+        if ($null -eq $script:MonitorProcess -or $script:MonitorProcess.HasExited) {
+            $code = if ($null -ne $script:MonitorProcess) { $script:MonitorProcess.ExitCode } else { 'n/a' }
             [System.Windows.Forms.MessageBox]::Show(
-                'Another FinalEclipse monitor is already running (GUI or logon task). Stop it first.',
-                'Monitor already running', 'OK', 'Warning') | Out-Null
+                "The hidden monitor did not stay running (exit $code). Another monitor may already own the singleton.",
+                'Monitor not started', 'OK', 'Warning') | Out-Null
+            $script:MonitorRunning = $false
+            Update-MonitorStatusUi
             return
         }
-        Invoke-DisableGdidPipeline
-        Invoke-WipeLocalDevicePuid -Quiet | Out-Null
-        Invoke-ClearLocalCaches -Quiet | Out-Null
         $script:MonitorRunning = $true
         $script:WatchdogTick = 0
         $script:LogRateLimit = @{}
@@ -1120,8 +1383,19 @@ $btnStartMon = New-ActionButton -Text 'Start live monitor' -X 12 -Y 382 -W 170 -
 
 $btnStopMon = New-ActionButton -Text 'Stop monitor' -X 190 -Y 382 -W 130 -OnClick {
     $watchTimer.Stop()
+    if ($null -ne $script:MonitorProcess -and -not $script:MonitorProcess.HasExited) {
+        try {
+            $script:MonitorProcess.Kill()
+            $script:MonitorProcess.WaitForExit(3000) | Out-Null
+        } catch {
+            Write-AppLog "Could not stop owned monitor process: $($_.Exception.Message)" 'WARN'
+        }
+    }
+    if ($null -ne $script:MonitorProcess) {
+        try { $script:MonitorProcess.Dispose() } catch { }
+        $script:MonitorProcess = $null
+    }
     $script:MonitorRunning = $false
-    Exit-MonitorMutex
     Update-MonitorStatusUi
     Write-AppLog 'Live monitor stopped.'
     Refresh-SnapshotUi
@@ -1191,6 +1465,18 @@ $form.Controls.AddRange(@(
 
 $form.Add_FormClosing({
     if ($watchTimer.Enabled) { $watchTimer.Stop() }
+    if ($null -ne $script:MonitorProcess -and -not $script:MonitorProcess.HasExited) {
+        try {
+            $script:MonitorProcess.Kill()
+            $script:MonitorProcess.WaitForExit(3000) | Out-Null
+        } catch {
+            Write-AppLog "Could not stop owned monitor process during exit: $($_.Exception.Message)" 'WARN'
+        }
+    }
+    if ($null -ne $script:MonitorProcess) {
+        try { $script:MonitorProcess.Dispose() } catch { }
+        $script:MonitorProcess = $null
+    }
     $script:MonitorRunning = $false
     Exit-MonitorMutex
 })
