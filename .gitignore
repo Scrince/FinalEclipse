@@ -1,2 +1,17 @@
 # Isolated release-signing GnuPG home (secret key material; never commit)
 .gnupg-release/
+
+# GnuPG secret key material
+private-keys-v1.d/
+secring.gpg
+*.key
+*.sec
+
+# Common private key / certificate container formats
+*.pem
+*.p12
+*.pfx
+id_rsa
+id_dsa
+id_ecdsa
+id_ed25519
