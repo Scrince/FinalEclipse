@@ -67,27 +67,24 @@ Recommended first pass:
 ## Command Line
 
 ```powershell
-# Open the GUI
 .\FinalEclipse.bat
 
-# Run the headless monitor every 5 seconds
 .\FinalEclipse.bat -Monitor
 
-# Run the headless monitor with a custom interval
 .\FinalEclipse.bat -Monitor -IntervalSeconds 10
 
-# Install or remove the elevated logon monitor task
 .\FinalEclipse.bat -InstallTask
 .\FinalEclipse.bat -UninstallTask
 
-# Run advanced hardening without opening the GUI
 .\FinalEclipse.bat -AdvancedHarden
 
-# Print monitor task health
+.\FinalEclipse.bat -AdvancedHarden -WhatIf
+
 .\FinalEclipse.bat -TaskHealth
 
-# Print a drift report and update the baseline
 .\FinalEclipse.bat -DriftReport
+
+.\FinalEclipse.bat -RestoreLatestBackup
 ```
 
 The interval is clamped between 2 seconds and 3600 seconds.
@@ -124,7 +121,9 @@ The monitor repeats these checks on each interval:
 - Periodically clears recovery actions on watched services.
 
 Only one monitor instance is allowed at a time. If another GUI or headless monitor
-is already running, a new monitor exits instead of competing with it.
+is already running, a new monitor exits instead of competing with it. The GUI
+starts its live monitor as a hidden child PowerShell process so watchdog work does
+not block the window.
 
 ## Advanced Hardening
 
@@ -154,7 +153,8 @@ Drift reports compare the current scan against the previous baseline stored at:
 
 The report highlights re-created IDs, changed service state, changed CDP cache
 presence, changed monitor task health, and changed known task counts. Each report
-updates the baseline after it is generated.
+updates the baseline after it is generated. Baseline updates are written through a
+temporary file and then moved into place to avoid leaving partial JSON behind.
 
 ## Backups And Logs
 
@@ -163,6 +163,10 @@ Backups are written to timestamped folders:
 ```text
 %ProgramData%\FinalEclipse\Backups\
 ```
+
+`Full harden` stops before making destructive changes if the backup step is
+incomplete. Use `-RestoreLatestBackup` to import the newest `.reg` files from the
+backup folder.
 
 Monitor logs are written here:
 
