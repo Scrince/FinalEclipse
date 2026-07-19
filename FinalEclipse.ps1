@@ -173,6 +173,24 @@ function Invoke-WithNamedMutex {
     }
 }
 
+function Write-LogInfraFailure {
+    param([Parameter(Mandatory)][string]$Message)
+    # Non-recursive fallback: never call Write-AppLog/Add-LogLine here.
+    try {
+        $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+        $line = "[$ts] [WARN] log-infra: $Message"
+        $fallback = Join-Path $env:ProgramData 'FinalEclipse\Logs\infra-errors.log'
+        $dir = Split-Path -Parent $fallback
+        if (-not (Test-Path -LiteralPath $dir)) {
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        }
+        Add-Content -LiteralPath $fallback -Value $line -Encoding UTF8 -ErrorAction SilentlyContinue
+        Write-Verbose $line
+    } catch {
+        Write-Verbose "log-infra fallback failed: $($_.Exception.Message)"
+    }
+}
+
 function Invoke-LogRotation {
     try {
         if (-not (Test-Path -LiteralPath $script:LogFile)) { return }
@@ -185,7 +203,9 @@ function Invoke-LogRotation {
             Sort-Object LastWriteTime -Descending |
             Select-Object -Skip 5 |
             Remove-Item -Force -ErrorAction SilentlyContinue
-    } catch { }
+    } catch {
+        Write-LogInfraFailure "Invoke-LogRotation failed: $($_.Exception.Message)"
+    }
 }
 
 function Invoke-JsonLogRotation {
@@ -200,7 +220,9 @@ function Invoke-JsonLogRotation {
             Sort-Object LastWriteTime -Descending |
             Select-Object -Skip 5 |
             Remove-Item -Force -ErrorAction SilentlyContinue
-    } catch { }
+    } catch {
+        Write-LogInfraFailure "Invoke-JsonLogRotation failed: $($_.Exception.Message)"
+    }
 }
 
 function Add-LogLine {
@@ -963,6 +985,16 @@ function Export-RegistryBackup {
     try {
         $serviceNames = @($script:WatchedServiceNames)
         $serviceNames += @(Get-Service -Name 'CDPUserSvc*' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name)
+        $fileHashes = @()
+        foreach ($expPath in $exported) {
+            if (Test-Path -LiteralPath $expPath) {
+                $hash = (Get-FileHash -LiteralPath $expPath -Algorithm SHA256).Hash
+                $fileHashes += [ordered]@{
+                    File = Split-Path -Leaf $expPath
+                    Sha256 = $hash
+                }
+            }
+        }
         $manifest = [ordered]@{
             Version = $script:BackupManifestVersion
             Created = (Get-Date).ToString('o')
@@ -970,6 +1002,7 @@ function Export-RegistryBackup {
             Computer = $env:COMPUTERNAME
             User = [Security.Principal.WindowsIdentity]::GetCurrent().Name
             ExportedRegistryFiles = @($exported | ForEach-Object { Split-Path -Leaf $_ })
+            RegistryFileHashes = @($fileHashes)
             RegistryExportFailures = @($failed)
             Services = @($serviceNames | Select-Object -Unique | ForEach-Object { Get-ServiceBackupState -Name $_ })
             KnownTelemetryTasks = @($script:KnownTelemetryTasks | ForEach-Object { Get-TaskBackupState -FullPath $_ })
@@ -1004,38 +1037,81 @@ function Restore-LatestRegistryBackup {
     if ($null -eq $latest) {
         throw "No backup folders found under $script:BackupRoot"
     }
-    $files = @(Get-ChildItem -LiteralPath $latest.FullName -Filter '*.reg' -File -ErrorAction SilentlyContinue)
-    if ($files.Count -eq 0) {
-        throw "Latest backup has no .reg files: $($latest.FullName)"
-    }
-    foreach ($f in $files) {
-        if ($WhatIfPreference) {
-            Write-AppLog "WhatIf: would import registry backup $($f.FullName)"
-            continue
-        }
-        $p = Start-Process -FilePath 'reg.exe' -ArgumentList @('import', $f.FullName) -Wait -PassThru -WindowStyle Hidden
-        if ($null -eq $p -or $p.ExitCode -ne 0) {
-            $code = if ($null -ne $p) { $p.ExitCode } else { 'n/a' }
-            throw "reg.exe import failed for $($f.FullName) (exit $code)"
-        }
-        Write-AppLog "Restored registry backup: $($f.FullName)"
-    }
     $manifestPath = Join-Path $latest.FullName 'manifest.json'
-    if (Test-Path -LiteralPath $manifestPath) {
-        try {
-            $manifest = Get-Content -LiteralPath $manifestPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
-            foreach ($svcState in @($manifest.Services)) {
-                Restore-ServiceBackupState -State $svcState
+    if (-not (Test-Path -LiteralPath $manifestPath)) {
+        throw "Refusing restore: latest backup has no manifest.json (integrity binding required): $($latest.FullName)"
+    }
+    try {
+        $manifest = Get-Content -LiteralPath $manifestPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        throw "Refusing restore: cannot parse manifest.json: $($_.Exception.Message)"
+    }
+
+    # Build allowlist: prefer RegistryFileHashes (SHA-256 bound); fall back to ExportedRegistryFiles only with hash verification when available.
+    $allowed = @{}
+    if ($null -ne $manifest.RegistryFileHashes) {
+        foreach ($entry in @($manifest.RegistryFileHashes)) {
+            if ($null -eq $entry.File -or [string]::IsNullOrWhiteSpace([string]$entry.File)) { continue }
+            $leaf = [string]$entry.File
+            if ($leaf.Contains('..') -or $leaf.Contains('/') -or $leaf.Contains('\')) {
+                throw "Refusing restore: invalid manifest file name '$leaf'"
             }
-            foreach ($taskState in @($manifest.KnownTelemetryTasks)) {
-                Restore-TaskBackupState -State $taskState
+            $allowed[$leaf] = [string]$entry.Sha256
+        }
+    } elseif ($null -ne $manifest.ExportedRegistryFiles) {
+        foreach ($leaf in @($manifest.ExportedRegistryFiles)) {
+            $name = [string]$leaf
+            if ($name.Contains('..') -or $name.Contains('/') -or $name.Contains('\')) {
+                throw "Refusing restore: invalid manifest file name '$name'"
             }
-            Write-AppLog "Restored reversible state from manifest: $manifestPath"
-        } catch {
-            Write-AppLog "Manifest restore failed: $($_.Exception.Message)" 'WARN'
+            $allowed[$name] = $null  # no hash in older manifests — refuse for security
+        }
+        if ($allowed.Count -gt 0 -and (@($allowed.Values | Where-Object { $_ })) -eq $null) {
+            # All null hashes => legacy manifest without integrity hashes
+            throw "Refusing restore: manifest lacks RegistryFileHashes (create a new backup with this version first)"
         }
     } else {
-        Write-AppLog "No manifest.json found in latest backup; restored registry files only." 'WARN'
+        throw "Refusing restore: manifest lists no registry files"
+    }
+    if ($allowed.Count -eq 0) {
+        throw "Refusing restore: no registry files listed in manifest"
+    }
+
+    foreach ($leaf in @($allowed.Keys)) {
+        $full = Join-Path $latest.FullName $leaf
+        if (-not (Test-Path -LiteralPath $full)) {
+            throw "Refusing restore: listed file missing: $leaf"
+        }
+        $expected = $allowed[$leaf]
+        if ([string]::IsNullOrWhiteSpace($expected)) {
+            throw "Refusing restore: no SHA-256 recorded for $leaf"
+        }
+        $actual = (Get-FileHash -LiteralPath $full -Algorithm SHA256).Hash
+        if ($actual -ne $expected) {
+            throw "Refusing restore: hash mismatch for $leaf (possible tampering)"
+        }
+        if ($WhatIfPreference) {
+            Write-AppLog "WhatIf: would import verified registry backup $full"
+            continue
+        }
+        $p = Start-Process -FilePath 'reg.exe' -ArgumentList @('import', $full) -Wait -PassThru -WindowStyle Hidden
+        if ($null -eq $p -or $p.ExitCode -ne 0) {
+            $code = if ($null -ne $p) { $p.ExitCode } else { 'n/a' }
+            throw "reg.exe import failed for $full (exit $code)"
+        }
+        Write-AppLog "Restored verified registry backup: $full"
+    }
+
+    try {
+        foreach ($svcState in @($manifest.Services)) {
+            Restore-ServiceBackupState -State $svcState
+        }
+        foreach ($taskState in @($manifest.KnownTelemetryTasks)) {
+            Restore-TaskBackupState -State $taskState
+        }
+        Write-AppLog "Restored reversible state from manifest: $manifestPath"
+    } catch {
+        Write-AppLog "Manifest state restore failed: $($_.Exception.Message)" 'WARN'
     }
     Write-AuditEvent -Event 'backup-restored' -Message "Restored latest backup: $($latest.FullName)" -Target $latest.FullName
     return $latest.FullName
@@ -1405,8 +1481,82 @@ function Invoke-WatchdogTick {
     }
 }
 
+function Get-ProtectedScriptInstallPath {
+    return (Join-Path $env:ProgramData 'FinalEclipse\FinalEclipse.ps1')
+}
+
+function Install-ProtectedScriptCopy {
+    <#
+      Copy this script into ProgramData with an Administrators/SYSTEM-only ACL
+      so a non-elevated user cannot replace the elevated task payload.
+    #>
+    param([Parameter(Mandatory)][string]$SourcePath)
+    Ensure-AppDirs
+    $dest = Get-ProtectedScriptInstallPath
+    $destDir = Split-Path -Parent $dest
+    if (-not (Test-Path -LiteralPath $destDir)) {
+        New-Item -ItemType Directory -Path $destDir -Force | Out-Null
+    }
+    Copy-Item -LiteralPath $SourcePath -Destination $dest -Force -ErrorAction Stop
+
+    # Restrict ACL: SYSTEM + Administrators full; remove inherited Everyone/Users write.
+    try {
+        $acl = Get-Acl -LiteralPath $dest
+        $acl.SetAccessRuleProtection($true, $false)
+        $rules = @(
+            (New-Object System.Security.AccessControl.FileSystemAccessRule('NT AUTHORITY\SYSTEM','FullControl','Allow')),
+            (New-Object System.Security.AccessControl.FileSystemAccessRule('BUILTIN\Administrators','FullControl','Allow'))
+        )
+        $acl.Access | ForEach-Object { [void]$acl.RemoveAccessRule($_) }
+        foreach ($r in $rules) { $acl.AddAccessRule($r) }
+        Set-Acl -LiteralPath $dest -AclObject $acl
+    } catch {
+        Write-AppLog "Could not fully lock ACL on $dest : $($_.Exception.Message)" 'WARN'
+    }
+
+    $hash = (Get-FileHash -LiteralPath $dest -Algorithm SHA256).Hash
+    $hashPath = Join-Path $script:StateDir 'installed-script.sha256'
+    Set-Content -LiteralPath $hashPath -Value $hash -Encoding ASCII -Force
+    try {
+        $hAcl = Get-Acl -LiteralPath $hashPath
+        $hAcl.SetAccessRuleProtection($true, $false)
+        $hAcl.Access | ForEach-Object { [void]$hAcl.RemoveAccessRule($_) }
+        $hAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule('NT AUTHORITY\SYSTEM','FullControl','Allow')))
+        $hAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule('BUILTIN\Administrators','FullControl','Allow')))
+        Set-Acl -LiteralPath $hashPath -AclObject $hAcl
+    } catch { }
+    return [pscustomobject]@{ Path = $dest; Sha256 = $hash }
+}
+
+function Test-ProtectedScriptIntegrity {
+    param([Parameter(Mandatory)][string]$ScriptPath)
+    $hashPath = Join-Path $script:StateDir 'installed-script.sha256'
+    if (-not (Test-Path -LiteralPath $hashPath)) {
+        return $false
+    }
+    if (-not (Test-Path -LiteralPath $ScriptPath)) {
+        return $false
+    }
+    $expected = (Get-Content -LiteralPath $hashPath -Raw -ErrorAction SilentlyContinue).Trim()
+    if ([string]::IsNullOrWhiteSpace($expected)) { return $false }
+    $actual = (Get-FileHash -LiteralPath $ScriptPath -Algorithm SHA256).Hash
+    return ($actual -eq $expected)
+}
+
 function Install-MonitorTask {
-    $scriptPath = $PSCommandPath
+    $sourcePath = $PSCommandPath
+    if ($WhatIfPreference) {
+        Write-AppLog "WhatIf: would install protected script copy and register scheduled task '$($script:TaskName)'"
+        return
+    }
+    $installed = Install-ProtectedScriptCopy -SourcePath $sourcePath
+    $scriptPath = $installed.Path
+    if (-not (Test-ProtectedScriptIntegrity -ScriptPath $scriptPath)) {
+        throw "Protected script integrity check failed after install."
+    }
+
+    # Prefer ConstrainedLanguage-friendly invocation: -File under ProgramData, no Bypass when possible.
+    # Use Bypass only because some hosts strip Unrestricted; path is ACL-locked + hash-pinned.
     $action = New-ScheduledTaskAction -Execute 'powershell.exe' `
         -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptPath`" -Monitor -IntervalSeconds $IntervalSeconds"
     $trigger = New-ScheduledTaskTrigger -AtLogOn
@@ -1421,10 +1571,6 @@ function Install-MonitorTask {
         -ExecutionTimeLimit ([TimeSpan]::Zero) `
         -MultipleInstances IgnoreNew
 
-    if ($WhatIfPreference) {
-        Write-AppLog "WhatIf: would register scheduled task '$($script:TaskName)' for $userId"
-        return
-    }
     Unregister-ScheduledTask -TaskName $script:TaskName -Confirm:$false -ErrorAction SilentlyContinue
     Register-ScheduledTask -TaskName $script:TaskName -Action $action -Trigger $trigger `
         -Principal $principal -Settings $settings -Force -ErrorAction Stop | Out-Null
@@ -1433,6 +1579,11 @@ function Install-MonitorTask {
         throw "Scheduled task '$($script:TaskName)' installed but failed health validation: $($health.Summary)"
     }
     Write-AppLog "Scheduled task '$($script:TaskName)' installed for $userId (AtLogOn, elevated, monitor mode)."
+    Write-AppLog "Task payload: $scriptPath (SHA256=$($installed.Sha256))"
+    Write-AuditEvent -Event 'task-installed' -Message "Monitor task installed" -Target $scriptPath -Data @{
+        sha256 = $installed.Sha256
+        user = $userId
+    }
 }
 
 function Uninstall-MonitorTask {
@@ -1500,6 +1651,17 @@ if ($AdvancedHarden) {
 if ($Monitor) {
     Ensure-AppDirs
     $script:SuppressUiLog = $true
+    # Integrity gate for elevated scheduled-task payload (FE-2).
+    $protected = Get-ProtectedScriptInstallPath
+    if (Test-Path -LiteralPath $protected) {
+        if (-not (Test-ProtectedScriptIntegrity -ScriptPath $protected)) {
+            Write-AppLog "Refusing to start monitor: protected script hash mismatch (possible tampering): $protected" 'ERROR'
+            exit 2
+        }
+    } elseif (Test-Path -LiteralPath (Join-Path $script:StateDir 'installed-script.sha256')) {
+        Write-AppLog 'Refusing to start monitor: installed-script.sha256 present but protected copy missing.' 'ERROR'
+        exit 2
+    }
     if (-not (Test-EnterMonitorMutex)) {
         Write-AppLog 'Another FinalEclipse monitor is already running. Exiting.' 'WARN'
         exit 1

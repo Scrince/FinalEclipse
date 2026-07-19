@@ -1,1 +1,5 @@
 .gnupg-release/
+*.pfx
+*.p12
+*.key
+*.pem
