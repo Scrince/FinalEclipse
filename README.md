@@ -22,6 +22,9 @@ The tool is intended for systems you own or administer.
 - Runs an optional watchdog monitor that repeats the hardening checks on an
   interval.
 - Can install that monitor as an elevated logon scheduled task.
+- Shows a dry-run and operation plan before destructive GUI actions.
+- Writes both human-readable logs and JSONL audit events.
+- Stores backup manifests with service, task, and environment state.
 
 ## Requirements
 
@@ -37,6 +40,8 @@ The tool is intended for systems you own or administer.
 | `FinalEclipse.bat` | Double-click launcher for the PowerShell app |
 | `FinalEclipse.ps1` | Main GUI, CLI, monitor, backup, and hardening script |
 | `Sign-Release.ps1` | Recreates detached signatures and checksum manifest |
+| `Test-Release.ps1` | Runs parser, static safety, and optional Pester release checks |
+| `Tests/FinalEclipse.Static.Tests.ps1` | Optional Pester static test suite |
 | `README.md` | This guide |
 | `*.asc` | Detached ASCII-armored PGP signatures for release files |
 | `docs/FinalEclipse_Release_Signing_2026_pubkey.asc` | Public release-signing key |
@@ -57,11 +62,12 @@ Recommended first pass:
 
 1. Click **Scan** to inspect current local identity state.
 2. Click **Backup** to export the relevant registry areas.
-3. Click **Full harden** to back up, disable the pipeline, run advanced hardening,
+3. Turn on **Dry run** if you want to preview changes without applying them.
+4. Click **Full harden** to back up, disable the pipeline, run advanced hardening,
    clear caches, and wipe local device ID values.
-4. Click **Start live monitor** to keep the local values from reappearing during
+5. Click **Start live monitor** to keep the local values from reappearing during
    the current session.
-5. Use **Install logon task** if you want the monitor to start automatically at
+6. Use **Install logon task** if you want the monitor to start automatically at
    sign-in.
 
 ## Command Line
@@ -85,6 +91,8 @@ Recommended first pass:
 .\FinalEclipse.bat -DriftReport
 
 .\FinalEclipse.bat -RestoreLatestBackup
+
+.\Test-Release.ps1
 ```
 
 The interval is clamped between 2 seconds and 3600 seconds.
@@ -94,6 +102,7 @@ The interval is clamped between 2 seconds and 3600 seconds.
 | Action | Effect |
 | --- | --- |
 | **Scan** | Shows local PUID/GDID-related values, CDP folder status, service state, MachineGuid, advertising ID, monitor task health, and known task count |
+| **Dry run** | Previews supported hardening, restore, task, and wipe changes without applying them |
 | **Backup** | Exports selected registry trees and writes a text snapshot under `%ProgramData%\FinalEclipse\Backups` |
 | **Disable pipeline** | Stops and disables CDP, CDPUserSvc instances, DiagTrack, and dmwappushservice; clears recovery actions; reapplies privacy policies |
 | **Clear caches** | Deletes IrisService registry cache and the local ConnectedDevicesPlatform folder |
@@ -107,6 +116,8 @@ The interval is clamped between 2 seconds and 3600 seconds.
 | **Task audit** | Displays the curated scheduled task list and current state |
 | **Drift report** | Compares the current scan to the previous baseline, then updates the baseline |
 | **Task health** | Shows whether the logon monitor task is installed, enabled, elevated, and pointing to this script |
+| **Restore latest** | Imports the newest registry backup and restores manifest-backed service/task state where possible |
+| **Environment** | Shows Windows, PowerShell, path, log, and admin context for support and compatibility checks |
 
 ## Live Monitor
 
@@ -164,9 +175,17 @@ Backups are written to timestamped folders:
 %ProgramData%\FinalEclipse\Backups\
 ```
 
+Each backup includes registry exports, `snapshot.txt`, and `manifest.json`. The
+manifest records the app versioned backup format, script path, environment,
+watched service startup state, service recovery query output, known telemetry task
+state, and registry export results.
+
 `Full harden` stops before making destructive changes if the backup step is
-incomplete. Use `-RestoreLatestBackup` to import the newest `.reg` files from the
-backup folder.
+incomplete. Use `-RestoreLatestBackup` or **Restore latest** to import the newest
+`.reg` files from the backup folder. When `manifest.json` is present, restore also
+attempts to reapply captured service startup types and scheduled task enabled
+states. It does not fully reconstruct deleted cache folders or service recovery
+actions.
 
 Monitor logs are written here:
 
@@ -174,7 +193,25 @@ Monitor logs are written here:
 %ProgramData%\FinalEclipse\Logs\monitor.log
 ```
 
-The log rotates when it reaches 2 MB and keeps the five most recent rotated logs.
+Machine-readable audit events are written here:
+
+```text
+%ProgramData%\FinalEclipse\Logs\events.jsonl
+```
+
+The text log rotates at 2 MB and the JSONL audit log rotates at 4 MB. Both keep
+the five most recent rotated logs.
+
+## Release Checks
+
+Run the release checks before signing:
+
+```powershell
+.\Test-Release.ps1
+```
+
+The check script validates PowerShell syntax, verifies expected safety markers,
+and runs the optional Pester suite when Pester is installed.
 
 ## Important Limits
 
@@ -206,8 +243,9 @@ Expected key identity:
 
 ```text
 FinalEclipse Release Signing (2026) <release@finaleclipse.local>
-Fingerprint: 2E2C F162 13EC E257 0406 C1C0 CE7A 8F43 AD8A F9D2
-Primary RSA-4096 signing key only; no subkeys
+Primary fingerprint: 2E2C F162 13EC E257 0406 C1C0 CE7A 8F43 AD8A F9D2
+Signing subkey: EBD3 817D EEA9 356D CE76 ABA8 6BAF DFAB F5F9 A1FA
+Encryption subkey: 64A6 668A 61F5 760A BB0D 1E1B 88DB E7EE 626F 9545
 ```
 
 Inspect the key before trusting it:
@@ -222,6 +260,8 @@ Import the key and verify release artifacts:
 gpg --import docs/FinalEclipse_Release_Signing_2026_pubkey.asc
 gpg --verify FinalEclipse.ps1.asc FinalEclipse.ps1
 gpg --verify FinalEclipse.bat.asc FinalEclipse.bat
+gpg --verify Test-Release.ps1.asc Test-Release.ps1
+gpg --verify Tests/FinalEclipse.Static.Tests.ps1.asc Tests/FinalEclipse.Static.Tests.ps1
 gpg --verify README.md.asc README.md
 gpg --verify docs/GITHUB_RELEASE.md.asc docs/GITHUB_RELEASE.md
 gpg --verify docs/SHA256SUMS.asc docs/SHA256SUMS
@@ -249,9 +289,10 @@ To recreate signatures and checksums:
 .\Sign-Release.ps1
 ```
 
-The script signs `FinalEclipse.ps1`, `FinalEclipse.bat`, `README.md`, and
-`docs/GITHUB_RELEASE.md`, exports the public key, rebuilds `docs/SHA256SUMS`, and
-signs the manifest.
+The script signs `FinalEclipse.ps1`, `FinalEclipse.bat`, `Test-Release.ps1`,
+`Tests/FinalEclipse.Static.Tests.ps1`, `README.md`, and
+`docs/GITHUB_RELEASE.md`, exports the public key, rebuilds `docs/SHA256SUMS`,
+and signs the manifest.
 
 ## Responsible Use
 
