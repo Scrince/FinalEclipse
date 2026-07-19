@@ -52,6 +52,8 @@ try {
     $files = @(
         (Join-Path $ProjectRoot 'FinalEclipse.ps1'),
         (Join-Path $ProjectRoot 'FinalEclipse.bat'),
+        (Join-Path $ProjectRoot 'Test-Release.ps1'),
+        (Join-Path $ProjectRoot 'Tests\FinalEclipse.Static.Tests.ps1'),
         (Join-Path $ProjectRoot 'README.md'),
         (Join-Path $ProjectRoot 'docs\GITHUB_RELEASE.md')
     )
@@ -75,6 +77,8 @@ try {
         $toHash = @(
             'FinalEclipse.ps1', 'FinalEclipse.ps1.asc',
             'FinalEclipse.bat', 'FinalEclipse.bat.asc',
+            'Test-Release.ps1', 'Test-Release.ps1.asc',
+            'Tests\FinalEclipse.Static.Tests.ps1', 'Tests\FinalEclipse.Static.Tests.ps1.asc',
             'README.md', 'README.md.asc',
             'docs\GITHUB_RELEASE.md', 'docs\GITHUB_RELEASE.md.asc',
             'docs\FinalEclipse_Release_Signing_2026_pubkey.asc'
