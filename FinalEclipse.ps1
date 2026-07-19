@@ -7,7 +7,8 @@ param(
     [switch]$AdvancedHarden,
     [switch]$DriftReport,
     [switch]$TaskHealth,
-    [switch]$RestoreLatestBackup
+    [switch]$RestoreLatestBackup,
+    [string]$RelaunchOutputPath = ''
 )
 
 Set-StrictMode -Version Latest
@@ -20,6 +21,8 @@ function Test-IsAdmin {
 }
 
 if (-not (Test-IsAdmin)) {
+    $isCliMode = $Monitor -or $InstallTask -or $UninstallTask -or $AdvancedHarden -or
+        $DriftReport -or $TaskHealth -or $RestoreLatestBackup
     $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"")
     if ($Monitor)         { $argList += '-Monitor' }
     if ($InstallTask)     { $argList += '-InstallTask' }
@@ -32,16 +35,38 @@ if (-not (Test-IsAdmin)) {
     if ($PSBoundParameters.ContainsKey('IntervalSeconds')) {
         $argList += @('-IntervalSeconds', "$IntervalSeconds")
     }
+    $relayPath = $null
+    if ($isCliMode) {
+        $relayPath = [System.IO.Path]::GetTempFileName()
+        $argList += @('-RelaunchOutputPath', "`"$relayPath`"")
+    }
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName  = 'powershell.exe'
     $psi.Arguments = ($argList -join ' ')
     $psi.Verb      = 'runas'
+    $psi.UseShellExecute = $true
+    $psi.WorkingDirectory = Split-Path -Parent $PSCommandPath
     try {
-        [Diagnostics.Process]::Start($psi) | Out-Null
+        $p = [Diagnostics.Process]::Start($psi)
+        if ($isCliMode -and $null -ne $p) {
+            $p.WaitForExit()
+            if ($relayPath -and (Test-Path -LiteralPath $relayPath)) {
+                $relayText = Get-Content -LiteralPath $relayPath -Raw -ErrorAction SilentlyContinue
+                if (-not [string]::IsNullOrEmpty($relayText)) {
+                    Write-Host $relayText -NoNewline
+                }
+                Remove-Item -LiteralPath $relayPath -Force -ErrorAction SilentlyContinue
+            }
+            exit $p.ExitCode
+        }
     } catch {
         Write-Host 'Administrator rights are required. Relaunch declined.' -ForegroundColor Yellow
+        if ($relayPath -and (Test-Path -LiteralPath $relayPath)) {
+            Remove-Item -LiteralPath $relayPath -Force -ErrorAction SilentlyContinue
+        }
+        exit 1
     }
-    exit
+    exit 0
 }
 
 $script:AppName     = 'FinalEclipse'
@@ -49,6 +74,7 @@ $script:BackupRoot  = Join-Path $env:ProgramData 'FinalEclipse\Backups'
 $script:LogDir      = Join-Path $env:ProgramData 'FinalEclipse\Logs'
 $script:StateDir    = Join-Path $env:ProgramData 'FinalEclipse\State'
 $script:LogFile     = Join-Path $script:LogDir 'monitor.log'
+$script:JsonLogFile = Join-Path $script:LogDir 'events.jsonl'
 $script:DriftPath   = Join-Path $script:StateDir 'last-snapshot.json'
 $script:TaskName    = 'FinalEclipse-Monitor'
 $script:MonitorRunning = $false
@@ -58,14 +84,31 @@ $script:LogRateLimit = @{}
 $script:Mutex = $null
 $script:MutexName = 'Global\FinalEclipse-Monitor-Singleton'
 $script:LogMutexName = 'Global\FinalEclipse-Log-Writer'
+$script:AuditMutexName = 'Global\FinalEclipse-Audit-Writer'
 $script:txtLog = $null
 $script:WatchdogBusy = $false
 $script:MonitorProcess = $null
 $script:MaxLogBytes = 2MB
+$script:MaxJsonLogBytes = 4MB
 $script:MaxUiLogChars = 120000
+$script:BackupManifestVersion = 2
+$script:RelaunchOutputPath = $RelaunchOutputPath
 
 if ($IntervalSeconds -lt 2) { $IntervalSeconds = 2 }
 if ($IntervalSeconds -gt 3600) { $IntervalSeconds = 3600 }
+
+function Write-CliHost {
+    param([AllowNull()][object]$Object)
+    $text = if ($null -eq $Object) { '' } else { "$Object" }
+    if (-not [string]::IsNullOrWhiteSpace($script:RelaunchOutputPath)) {
+        try {
+            Add-Content -LiteralPath $script:RelaunchOutputPath -Value $text -Encoding UTF8 -ErrorAction Stop
+        } catch {
+            Write-Verbose "Relaunch output relay failed: $($_.Exception.Message)"
+        }
+    }
+    Write-Host $text
+}
 
 $IdentityExtProps  = 'HKCU:\SOFTWARE\Microsoft\IdentityCRL\ExtendedProperties'
 $IdentityImmersive = 'HKCU:\SOFTWARE\Microsoft\IdentityCRL\Immersive\production\Token'
@@ -145,6 +188,21 @@ function Invoke-LogRotation {
     } catch { }
 }
 
+function Invoke-JsonLogRotation {
+    try {
+        if (-not (Test-Path -LiteralPath $script:JsonLogFile)) { return }
+        $fi = Get-Item -LiteralPath $script:JsonLogFile -ErrorAction SilentlyContinue
+        if ($null -eq $fi -or $fi.Length -lt $script:MaxJsonLogBytes) { return }
+        $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+        $archive = Join-Path $script:LogDir ("events_{0}.jsonl" -f $stamp)
+        Move-Item -LiteralPath $script:JsonLogFile -Destination $archive -Force -ErrorAction Stop
+        Get-ChildItem -LiteralPath $script:LogDir -Filter 'events_*.jsonl' -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -Skip 5 |
+            Remove-Item -Force -ErrorAction SilentlyContinue
+    } catch { }
+}
+
 function Add-LogLine {
     param([Parameter(Mandatory)][string]$Line)
     Invoke-WithNamedMutex -Name $script:LogMutexName -Action {
@@ -152,6 +210,37 @@ function Add-LogLine {
         Invoke-LogRotation
         Add-Content -LiteralPath $script:LogFile -Value $Line -Encoding UTF8 -ErrorAction Stop
     } -TimeoutMs 2000
+}
+
+function Write-AuditEvent {
+    param(
+        [Parameter(Mandatory)][string]$Event,
+        [string]$Level = 'INFO',
+        [string]$Message = '',
+        [string]$Target = '',
+        [hashtable]$Data = @{}
+    )
+    try {
+        Invoke-WithNamedMutex -Name $script:AuditMutexName -Action {
+            Ensure-AppDirs
+            Invoke-JsonLogRotation
+            $body = [ordered]@{
+                timestamp = (Get-Date).ToString('o')
+                app = $script:AppName
+                event = $Event
+                level = $Level
+                user = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+                computer = $env:COMPUTERNAME
+                target = $Target
+                message = $Message
+                data = $Data
+            }
+            ($body | ConvertTo-Json -Depth 8 -Compress) |
+                Add-Content -LiteralPath $script:JsonLogFile -Encoding UTF8 -ErrorAction Stop
+        } -TimeoutMs 2000
+    } catch {
+        Write-Verbose "Audit write failed: $($_.Exception.Message)"
+    }
 }
 
 function Write-AppLog {
@@ -178,9 +267,10 @@ function Write-AppLog {
     } catch {
         Write-Verbose "Log write failed: $($_.Exception.Message)"
     }
+    Write-AuditEvent -Event 'log' -Level $Level -Message $Message
 
     if ($script:SuppressUiLog) {
-        Write-Host $line
+        Write-CliHost $line
         return
     }
     if ($null -ne $script:txtLog) {
@@ -195,7 +285,7 @@ function Write-AppLog {
             }
         } catch { }
     } else {
-        Write-Host $line
+        Write-CliHost $line
     }
 }
 
@@ -303,6 +393,50 @@ function Get-ServiceState {
     return "$($svc.Status) / $($svc.StartType)"
 }
 
+function Get-ServiceBackupState {
+    param([string]$Name)
+    $svc = Get-Service -Name $Name -ErrorAction SilentlyContinue
+    if (-not $svc) {
+        return [ordered]@{
+            Name = $Name
+            Installed = $false
+            Status = 'Not installed'
+            StartType = 'n/a'
+            FailureConfig = ''
+        }
+    }
+    $failureConfig = ''
+    try {
+        $failureConfig = ((& sc.exe qfailure "$Name" 2>&1) | ForEach-Object { "$_" }) -join "`n"
+    } catch {
+        $failureConfig = "Unavailable: $($_.Exception.Message)"
+    }
+    return [ordered]@{
+        Name = $Name
+        Installed = $true
+        Status = [string]$svc.Status
+        StartType = [string]$svc.StartType
+        FailureConfig = $failureConfig
+    }
+}
+
+function Restore-ServiceBackupState {
+    param($State)
+    if ($null -eq $State -or -not $State.Installed) { return }
+    $svc = Get-Service -Name $State.Name -ErrorAction SilentlyContinue
+    if (-not $svc) { return }
+    if ($WhatIfPreference) {
+        Write-AppLog "WhatIf: would restore service $($State.Name) startup type to $($State.StartType)"
+        return
+    }
+    try {
+        Set-Service -Name $State.Name -StartupType $State.StartType -ErrorAction Stop
+        Write-AppLog "Restored service startup type: $($State.Name) -> $($State.StartType)"
+    } catch {
+        Write-AppLog "Could not restore startup type for $($State.Name): $($_.Exception.Message)" 'WARN'
+    }
+}
+
 function Split-TaskPath {
     param([Parameter(Mandatory)][string]$FullPath)
     $trimmed = $FullPath.Trim()
@@ -313,6 +447,49 @@ function Split-TaskPath {
     return [pscustomobject]@{
         TaskPath = ($trimmed.Substring(0, $ix + 1))
         TaskName = ($trimmed.Substring($ix + 1))
+    }
+}
+
+function Get-TaskBackupState {
+    param([string]$FullPath)
+    $parts = Split-TaskPath -FullPath $FullPath
+    $task = Get-ScheduledTask -TaskPath $parts.TaskPath -TaskName $parts.TaskName -ErrorAction SilentlyContinue
+    if ($null -eq $task) {
+        return [ordered]@{
+            Path = $FullPath
+            Installed = $false
+            State = 'Not installed'
+        }
+    }
+    return [ordered]@{
+        Path = $FullPath
+        Installed = $true
+        State = [string]$task.State
+    }
+}
+
+function Restore-TaskBackupState {
+    param($State)
+    if ($null -eq $State -or -not $State.Installed) { return }
+    $parts = Split-TaskPath -FullPath $State.Path
+    $task = Get-ScheduledTask -TaskPath $parts.TaskPath -TaskName $parts.TaskName -ErrorAction SilentlyContinue
+    if ($null -eq $task) { return }
+    try {
+        if ($State.State -eq 'Disabled') {
+            if ($WhatIfPreference) { Write-AppLog "WhatIf: would disable task $($State.Path)" }
+            else {
+                Disable-ScheduledTask -TaskPath $parts.TaskPath -TaskName $parts.TaskName -ErrorAction Stop | Out-Null
+                Write-AppLog "Restored task disabled state: $($State.Path)"
+            }
+        } elseif ($task.State -eq 'Disabled') {
+            if ($WhatIfPreference) { Write-AppLog "WhatIf: would enable task $($State.Path)" }
+            else {
+                Enable-ScheduledTask -TaskPath $parts.TaskPath -TaskName $parts.TaskName -ErrorAction Stop | Out-Null
+                Write-AppLog "Restored task enabled state: $($State.Path)"
+            }
+        }
+    } catch {
+        Write-AppLog "Could not restore task $($State.Path): $($_.Exception.Message)" 'WARN'
     }
 }
 
@@ -528,6 +705,77 @@ function Format-SnapshotText {
     return $sb.ToString()
 }
 
+function Get-EnvironmentReport {
+    $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction SilentlyContinue
+    $ps = $PSVersionTable
+    return [ordered]@{
+        App = $script:AppName
+        ScriptPath = $PSCommandPath
+        IsAdmin = (Test-IsAdmin)
+        User = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+        Computer = $env:COMPUTERNAME
+        PowerShellVersion = [string]$ps.PSVersion
+        PowerShellEdition = [string]$ps.PSEdition
+        CLRVersion = [string]$ps.CLRVersion
+        OSName = if ($os) { [string]$os.Caption } else { 'Unavailable' }
+        OSVersion = if ($os) { [string]$os.Version } else { 'Unavailable' }
+        OSBuild = if ($os) { [string]$os.BuildNumber } else { 'Unavailable' }
+        BackupRoot = $script:BackupRoot
+        LogFile = $script:LogFile
+        JsonLogFile = $script:JsonLogFile
+        StateDir = $script:StateDir
+    }
+}
+
+function Format-EnvironmentReportText {
+    $envReport = Get-EnvironmentReport
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.AppendLine('=== Environment ===')
+    foreach ($key in $envReport.Keys) {
+        [void]$sb.AppendLine(("{0}: {1}" -f $key, $envReport[$key]))
+    }
+    return $sb.ToString()
+}
+
+function Format-OperationPlanText {
+    param([ValidateSet('Wipe','Advanced','Full','Restore')]$Operation)
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.AppendLine("=== Planned operation: $Operation ===")
+    [void]$sb.AppendLine("Dry run: $(if ($WhatIfPreference) { 'ON' } else { 'off' })")
+    [void]$sb.AppendLine('')
+    switch ($Operation) {
+        'Wipe' {
+            [void]$sb.AppendLine('Will remove local identity values when present:')
+            [void]$sb.AppendLine("  $IdentityExtProps\LID, DeviceId, GlobalDeviceId")
+            [void]$sb.AppendLine("  $IdentityImmersive token DeviceId and LID values")
+            [void]$sb.AppendLine('  HKLM:\SOFTWARE\Microsoft\IdentityStore DeviceId, LID, GlobalDeviceId values')
+        }
+        'Advanced' {
+            [void]$sb.AppendLine('Will clear service recovery actions for:')
+            foreach ($n in $script:WatchedServiceNames) { [void]$sb.AppendLine("  $n") }
+            [void]$sb.AppendLine('  CDPUserSvc* instances')
+            [void]$sb.AppendLine('')
+            [void]$sb.AppendLine('Will disable known telemetry/feedback scheduled tasks when installed:')
+            foreach ($t in $script:KnownTelemetryTasks) { [void]$sb.AppendLine("  $t") }
+            [void]$sb.AppendLine('')
+            [void]$sb.AppendLine('Will reapply Activity History, telemetry, and Advertising ID policies.')
+        }
+        'Full' {
+            [void]$sb.AppendLine("Will create a backup under: $script:BackupRoot")
+            [void]$sb.AppendLine('Will stop/disable watched services and CDPUserSvc* instances.')
+            [void]$sb.AppendLine('Will run Advanced harden.')
+            [void]$sb.AppendLine("Will remove IrisService cache: $IrisServiceKey")
+            [void]$sb.AppendLine("Will remove CDP local folder: $CDPLocal")
+            [void]$sb.AppendLine('Will wipe local PUID/GDID registry values listed in the Wipe plan.')
+        }
+        'Restore' {
+            [void]$sb.AppendLine("Will import .reg files from the newest folder under: $script:BackupRoot")
+            [void]$sb.AppendLine('When manifest.json is present, will restore captured service startup types and scheduled task enabled states.')
+        }
+    }
+    return $sb.ToString()
+}
+
 function Disable-ServiceRecovery {
     param([string]$Name, [switch]$Quiet)
     $svc = Get-Service -Name $Name -ErrorAction SilentlyContinue
@@ -548,7 +796,9 @@ function Disable-ServiceRecovery {
 
     try {
         & sc.exe failureflag "$Name" 0 2>$null | Out-Null
-    } catch { }
+    } catch {
+        Write-AppLog "Service failure flag reset error for ${Name}: $($_.Exception.Message)" 'WARN' -RateLimitTicks 24
+    }
 
     if ($changed -and -not $Quiet) {
         Write-AppLog "Cleared service recovery actions: $Name"
@@ -632,7 +882,7 @@ function Disable-ServiceHard {
 
     $after = Wait-ServiceStableState -Name $Name -NeedStopped:$neededStop -NeedDisabled:$neededDisable
     if (-not $after) { return $false }
-    $nowStopped  = ($after.Status -eq 'Stopped' -or $after.Status -eq 'StopPending')
+    $nowStopped  = ($after.Status -eq 'Stopped')
     $nowDisabled = ($after.StartType -eq [System.ServiceProcess.ServiceStartMode]::Disabled)
     $changed = ($neededStop -and $nowStopped) -or ($neededDisable -and $nowDisabled)
 
@@ -654,6 +904,17 @@ function Disable-ServiceHard {
 }
 
 function Export-RegistryBackup {
+    if ($WhatIfPreference) {
+        Write-AppLog 'WhatIf: would create registry backup'
+        return [pscustomobject]@{
+            Path = $null
+            Success = $true
+            Exported = @()
+            Failed = @()
+            Skipped = $true
+        }
+    }
+
     Ensure-AppDirs
     $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
     $dir = Join-Path $script:BackupRoot $stamp
@@ -698,6 +959,35 @@ function Export-RegistryBackup {
         Write-AppLog "Snapshot backup failed: $($_.Exception.Message)" 'ERROR'
         $failed += 'snapshot.txt'
     }
+    $manifestPath = Join-Path $dir 'manifest.json'
+    try {
+        $serviceNames = @($script:WatchedServiceNames)
+        $serviceNames += @(Get-Service -Name 'CDPUserSvc*' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name)
+        $manifest = [ordered]@{
+            Version = $script:BackupManifestVersion
+            Created = (Get-Date).ToString('o')
+            ScriptPath = $PSCommandPath
+            Computer = $env:COMPUTERNAME
+            User = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+            ExportedRegistryFiles = @($exported | ForEach-Object { Split-Path -Leaf $_ })
+            RegistryExportFailures = @($failed)
+            Services = @($serviceNames | Select-Object -Unique | ForEach-Object { Get-ServiceBackupState -Name $_ })
+            KnownTelemetryTasks = @($script:KnownTelemetryTasks | ForEach-Object { Get-TaskBackupState -FullPath $_ })
+            Environment = Get-EnvironmentReport
+        }
+        $manifest | ConvertTo-Json -Depth 10 |
+            Set-Content -LiteralPath $manifestPath -Encoding UTF8 -ErrorAction Stop
+        Write-AppLog "Backup manifest written: $manifestPath"
+        Write-AuditEvent -Event 'backup-created' -Message "Backup created: $dir" -Target $dir -Data @{
+            success = ($failed.Count -eq 0)
+            exported = @($exported)
+            failed = @($failed)
+            manifest = $manifestPath
+        }
+    } catch {
+        Write-AppLog "Backup manifest failed: $($_.Exception.Message)" 'ERROR'
+        $failed += 'manifest.json'
+    }
     return [pscustomobject]@{
         Path = $dir
         Success = ($failed.Count -eq 0)
@@ -730,6 +1020,24 @@ function Restore-LatestRegistryBackup {
         }
         Write-AppLog "Restored registry backup: $($f.FullName)"
     }
+    $manifestPath = Join-Path $latest.FullName 'manifest.json'
+    if (Test-Path -LiteralPath $manifestPath) {
+        try {
+            $manifest = Get-Content -LiteralPath $manifestPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+            foreach ($svcState in @($manifest.Services)) {
+                Restore-ServiceBackupState -State $svcState
+            }
+            foreach ($taskState in @($manifest.KnownTelemetryTasks)) {
+                Restore-TaskBackupState -State $taskState
+            }
+            Write-AppLog "Restored reversible state from manifest: $manifestPath"
+        } catch {
+            Write-AppLog "Manifest restore failed: $($_.Exception.Message)" 'WARN'
+        }
+    } else {
+        Write-AppLog "No manifest.json found in latest backup; restored registry files only." 'WARN'
+    }
+    Write-AuditEvent -Event 'backup-restored' -Message "Restored latest backup: $($latest.FullName)" -Target $latest.FullName
     return $latest.FullName
 }
 
@@ -1027,7 +1335,9 @@ function Invoke-WipeLocalDevicePuid {
                     if ($Quiet) { Write-AppLog "Monitor: wiped IdentityStore $name" 'WARN' -RateLimitTicks 6 }
                     else { Write-AppLog "Cleared IdentityStore $name" }
                 }
-            } catch { }
+            } catch {
+                Write-AppLog "IdentityStore scan/wipe error under $($_.PSPath): $($_.Exception.Message)" 'WARN' -RateLimitTicks 12
+            }
         }
     }
 
@@ -1156,7 +1466,7 @@ if ($InstallTask) {
 if ($TaskHealth) {
     Ensure-AppDirs
     $script:SuppressUiLog = $true
-    Write-Host (Format-TaskHealthText)
+    Write-CliHost (Format-TaskHealthText)
     exit 0
 }
 
@@ -1165,7 +1475,7 @@ if ($RestoreLatestBackup) {
     $script:SuppressUiLog = $true
     try {
         $restored = Restore-LatestRegistryBackup
-        Write-Host "Restored latest registry backup: $restored"
+        Write-CliHost "Restored latest registry backup: $restored"
         exit 0
     } catch {
         Write-AppLog "Restore failed: $($_.Exception.Message)" 'ERROR'
@@ -1176,7 +1486,7 @@ if ($RestoreLatestBackup) {
 if ($DriftReport) {
     Ensure-AppDirs
     $script:SuppressUiLog = $true
-    Write-Host (Format-DriftReport)
+    Write-CliHost (Format-DriftReport)
     exit 0
 }
 
@@ -1248,9 +1558,16 @@ $lblStatus.Anchor = 'Top,Left,Right'
 $lblStatus.ForeColor = [System.Drawing.Color]::DarkRed
 $lblStatus.Text = 'Monitor: STOPPED'
 
+$chkDryRun = New-Object System.Windows.Forms.CheckBox
+$chkDryRun.Location = New-Object System.Drawing.Point(760, 322)
+$chkDryRun.Size = New-Object System.Drawing.Size(152, 22)
+$chkDryRun.Anchor = 'Top,Right'
+$chkDryRun.Text = 'Dry run'
+$chkDryRun.Checked = [bool]$WhatIfPreference
+
 $script:txtLog = New-Object System.Windows.Forms.TextBox
-$script:txtLog.Location = New-Object System.Drawing.Point(12, 464)
-$script:txtLog.Size = New-Object System.Drawing.Size(900, 208)
+$script:txtLog.Location = New-Object System.Drawing.Point(12, 498)
+$script:txtLog.Size = New-Object System.Drawing.Size(900, 174)
 $script:txtLog.Multiline = $true
 $script:txtLog.ScrollBars = 'Vertical'
 $script:txtLog.ReadOnly = $true
@@ -1259,7 +1576,7 @@ $script:txtLog.Anchor = 'Top,Bottom,Left,Right'
 $script:txtLog.WordWrap = $false
 
 $lblLog = New-Object System.Windows.Forms.Label
-$lblLog.Location = New-Object System.Drawing.Point(12, 444)
+$lblLog.Location = New-Object System.Drawing.Point(12, 478)
 $lblLog.Size = New-Object System.Drawing.Size(400, 18)
 $lblLog.Text = "Action log  (also: $($script:LogFile))"
 $lblLog.Anchor = 'Top,Left'
@@ -1273,6 +1590,39 @@ function New-ActionButton {
     $b.Anchor = 'Top,Left'
     $b.Add_Click($OnClick)
     return $b
+}
+
+function Invoke-GuiAction {
+    param(
+        [Parameter(Mandatory)][scriptblock]$Action,
+        [switch]$RefreshAfter
+    )
+    $oldWhatIf = $WhatIfPreference
+    $WhatIfPreference = [bool]$chkDryRun.Checked
+    try {
+        & $Action
+        if ($RefreshAfter) { Refresh-SnapshotUi }
+    } finally {
+        $WhatIfPreference = $oldWhatIf
+    }
+}
+
+function Confirm-GuiOperation {
+    param(
+        [Parameter(Mandatory)][ValidateSet('Wipe','Advanced','Full','Restore')]$Operation,
+        [Parameter(Mandatory)][string]$Title
+    )
+    $oldWhatIf = $WhatIfPreference
+    $WhatIfPreference = [bool]$chkDryRun.Checked
+    try {
+        $plan = Format-OperationPlanText -Operation $Operation
+        $txtSnap.Text = $plan
+        $message = "$plan`r`nContinue?"
+        $r = [System.Windows.Forms.MessageBox]::Show($message, $Title, 'YesNo', 'Warning')
+        return ($r -eq 'Yes')
+    } finally {
+        $WhatIfPreference = $oldWhatIf
+    }
 }
 
 function Refresh-SnapshotUi {
@@ -1320,28 +1670,22 @@ $btnScan = New-ActionButton -Text 'Scan' -X 12 -Y 348 -OnClick {
     Write-AppLog 'Snapshot refreshed.'
 }
 $btnBackup = New-ActionButton -Text 'Backup' -X 168 -Y 348 -OnClick {
-    try { $null = Export-RegistryBackup } catch { Write-AppLog $_.Exception.Message 'ERROR' }
+    try { Invoke-GuiAction { $null = Export-RegistryBackup } } catch { Write-AppLog $_.Exception.Message 'ERROR' }
 }
 $btnDisable = New-ActionButton -Text 'Disable pipeline' -X 324 -Y 348 -OnClick {
-    try { Invoke-DisableGdidPipeline; Refresh-SnapshotUi } catch { Write-AppLog $_.Exception.Message 'ERROR' }
+    try { Invoke-GuiAction { Invoke-DisableGdidPipeline } -RefreshAfter } catch { Write-AppLog $_.Exception.Message 'ERROR' }
 }
 $btnClear = New-ActionButton -Text 'Clear caches' -X 480 -Y 348 -OnClick {
-    try { Invoke-ClearLocalCaches | Out-Null; Refresh-SnapshotUi } catch { Write-AppLog $_.Exception.Message 'ERROR' }
+    try { Invoke-GuiAction { Invoke-ClearLocalCaches | Out-Null } -RefreshAfter } catch { Write-AppLog $_.Exception.Message 'ERROR' }
 }
 $btnWipe = New-ActionButton -Text 'Wipe local PUID' -X 636 -Y 348 -OnClick {
-    $r = [System.Windows.Forms.MessageBox]::Show(
-        "Removes local IdentityCRL device id values.`r`nMSA device features may break until re-registration.`r`nContinue?",
-        'Confirm wipe', 'YesNo', 'Warning')
-    if ($r -eq 'Yes') {
-        try { Invoke-WipeLocalDevicePuid | Out-Null; Refresh-SnapshotUi } catch { Write-AppLog $_.Exception.Message 'ERROR' }
+    if (Confirm-GuiOperation -Operation Wipe -Title 'Confirm wipe') {
+        try { Invoke-GuiAction { Invoke-WipeLocalDevicePuid | Out-Null } -RefreshAfter } catch { Write-AppLog $_.Exception.Message 'ERROR' }
     }
 }
 $btnFull = New-ActionButton -Text 'Full harden' -X 792 -Y 348 -W 120 -OnClick {
-    $r = [System.Windows.Forms.MessageBox]::Show(
-        'Backup + disable pipeline + clear caches + wipe local PUID. Continue?',
-        'Full harden', 'YesNo', 'Warning')
-    if ($r -eq 'Yes') {
-        try { Invoke-FullHarden; Refresh-SnapshotUi } catch { Write-AppLog $_.Exception.Message 'ERROR' }
+    if (Confirm-GuiOperation -Operation Full -Title 'Full harden') {
+        try { Invoke-GuiAction { Invoke-FullHarden } -RefreshAfter } catch { Write-AppLog $_.Exception.Message 'ERROR' }
     }
 }
 
@@ -1350,7 +1694,7 @@ $btnStartMon = New-ActionButton -Text 'Start live monitor' -X 12 -Y 382 -W 170 -
         if ($null -ne $script:MonitorProcess -and -not $script:MonitorProcess.HasExited) { return }
         $argList = @('-NoProfile', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass',
             '-File', "`"$PSCommandPath`"", '-Monitor', '-IntervalSeconds', "$IntervalSeconds")
-        if ($WhatIfPreference) { $argList += '-WhatIf' }
+        if ($WhatIfPreference -or $chkDryRun.Checked) { $argList += '-WhatIf' }
         $psi = New-Object System.Diagnostics.ProcessStartInfo
         $psi.FileName = 'powershell.exe'
         $psi.Arguments = ($argList -join ' ')
@@ -1403,7 +1747,7 @@ $btnStopMon = New-ActionButton -Text 'Stop monitor' -X 190 -Y 382 -W 130 -OnClic
 
 $btnInstallTask = New-ActionButton -Text 'Install logon task' -X 328 -Y 382 -W 150 -OnClick {
     try {
-        Install-MonitorTask
+        Invoke-GuiAction { Install-MonitorTask }
         [System.Windows.Forms.MessageBox]::Show(
             "Task '$($script:TaskName)' will start headless monitor at logon.`r`nLogs: $($script:LogFile)",
             'Task installed', 'OK', 'Information') | Out-Null
@@ -1414,18 +1758,15 @@ $btnInstallTask = New-ActionButton -Text 'Install logon task' -X 328 -Y 382 -W 1
 
 $btnRemoveTask = New-ActionButton -Text 'Remove logon task' -X 486 -Y 382 -W 150 -OnClick {
     try {
-        Uninstall-MonitorTask
+        Invoke-GuiAction { Uninstall-MonitorTask }
     } catch {
         Write-AppLog "Remove task failed: $($_.Exception.Message)" 'ERROR'
     }
 }
 
 $btnAdvanced = New-ActionButton -Text 'Advanced harden' -X 644 -Y 382 -W 140 -OnClick {
-    $r = [System.Windows.Forms.MessageBox]::Show(
-        'Clears service recovery actions, disables curated telemetry scheduled tasks, reapplies policies, and checks monitor task health. Continue?',
-        'Advanced harden', 'YesNo', 'Warning')
-    if ($r -eq 'Yes') {
-        try { Invoke-AdvancedHardening; Refresh-SnapshotUi } catch { Write-AppLog $_.Exception.Message 'ERROR' }
+    if (Confirm-GuiOperation -Operation Advanced -Title 'Advanced harden') {
+        try { Invoke-GuiAction { Invoke-AdvancedHardening } -RefreshAfter } catch { Write-AppLog $_.Exception.Message 'ERROR' }
     }
 }
 
@@ -1456,11 +1797,31 @@ $btnTaskHealth = New-ActionButton -Text 'Task health' -X 170 -Y 416 -W 150 -OnCl
     }
 }
 
+$btnRestore = New-ActionButton -Text 'Restore latest' -X 328 -Y 416 -W 150 -OnClick {
+    if (Confirm-GuiOperation -Operation Restore -Title 'Restore latest backup') {
+        try {
+            Invoke-GuiAction { $restored = Restore-LatestRegistryBackup; Write-AppLog "Restore finished from $restored" } -RefreshAfter
+        } catch {
+            Write-AppLog "Restore failed: $($_.Exception.Message)" 'ERROR'
+        }
+    }
+}
+
+$btnEnvironment = New-ActionButton -Text 'Environment' -X 486 -Y 416 -W 150 -OnClick {
+    try {
+        $txtSnap.Text = Format-EnvironmentReportText
+        Write-AppLog 'Environment report refreshed.'
+    } catch {
+        Write-AppLog $_.Exception.Message 'ERROR'
+    }
+}
+
 $form.Controls.AddRange(@(
-    $lblHeader, $txtSnap, $lblStatus, $lblLog, $script:txtLog,
+    $lblHeader, $txtSnap, $lblStatus, $chkDryRun, $lblLog, $script:txtLog,
     $btnScan, $btnBackup, $btnDisable, $btnClear, $btnWipe, $btnFull,
     $btnStartMon, $btnStopMon, $btnInstallTask, $btnRemoveTask,
-    $btnAdvanced, $btnTaskAudit, $btnDrift, $btnTaskHealth
+    $btnAdvanced, $btnTaskAudit, $btnDrift, $btnTaskHealth,
+    $btnRestore, $btnEnvironment
 ))
 
 $form.Add_FormClosing({
