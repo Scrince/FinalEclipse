@@ -33,6 +33,27 @@ The tool is intended for systems you own or administer.
 - Windows desktop session for the GUI
 - GnuPG only if you need to verify or recreate release signatures
 
+## Windows Version Compatibility
+
+| Area | Windows 10 | Windows 11 | Notes |
+| --- | --- | --- | --- |
+| PowerShell 5.1 host | Supported | Supported | Primary runtime; Windows PowerShell, not PowerShell 7-only syntax |
+| Watched services (`CDPSvc`, `DiagTrack`, `dmwappushservice`, `CDPUserSvc*`) | Present on most SKUs | Present on most SKUs | Home/Pro/Enterprise may differ; some IoT/Server SKUs omit consumer services |
+| Curated telemetry scheduled tasks | Names generally stable | Names generally stable | Builds may omit individual tasks under Application Experience, CEIP, Feedback, DiskDiagnostic |
+| Logon task `FinalEclipse-Monitor` | Supported | Supported | Registered with elevated interactive principal at logon; task name is stable across 10/11 |
+| Service recovery (`sc.exe qfailure` / `failure`) | Supported | Supported | Captured into backup manifest `Services[].FailureConfig` for restore |
+| GUI (WinForms) | Supported | Supported | Requires a desktop session |
+
+### Soft-fail philosophy
+
+FinalEclipse treats missing services and missing curated tasks as **soft failures**, not hard errors:
+
+- If a watched service is not installed, disable/recovery/restore steps log a clear line such as `Service not installed; soft-fail skip...` and continue.
+- If a known telemetry task path is not present on the build, disable/restore logs `Scheduled task not installed; soft-fail skip...` and continues.
+- Hardening, monitor ticks, and uninstall therefore complete on SKUs where Microsoft already removed a component.
+
+Only integrity and operator-required steps (for example a missing backup during Full harden, hash mismatch on restore, or failed task health after install) remain hard failures.
+
 ## Files
 
 | Path | Purpose |
@@ -82,6 +103,9 @@ Recommended first pass:
 .\FinalEclipse.bat -InstallTask
 .\FinalEclipse.bat -UninstallTask
 
+.\FinalEclipse.bat -UninstallAll
+.\FinalEclipse.bat -UninstallAll -RemoveAppData
+
 .\FinalEclipse.bat -AdvancedHarden
 
 .\FinalEclipse.bat -AdvancedHarden -WhatIf
@@ -96,6 +120,15 @@ Recommended first pass:
 ```
 
 The interval is clamped between 2 seconds and 3600 seconds.
+
+### Uninstall all
+
+`-UninstallAll` (GUI: **Uninstall all**) removes the `FinalEclipse-Monitor` logon task and stops any running FinalEclipse monitor process for this script.
+
+- By default it does **not** delete `%ProgramData%\FinalEclipse` data. The CLI prompts whether to remove backups, logs, state, and the protected script copy; pass `-RemoveAppData` to delete that data without a prompt. The GUI asks with a Yes/No/Cancel dialog.
+- Uninstall all does **not** re-enable telemetry services, curated tasks, or privacy policies. To reverse hardening:
+  1. Prefer **Restore latest** / `-RestoreLatestBackup` if you created a backup before hardening (restores registry exports plus manifest-backed service startup types, recovery actions when stored, and task enablement).
+  2. Or manually re-enable services (for example `DiagTrack`), re-enable known telemetry tasks, and adjust policies under `HKLM\SOFTWARE\Policies\Microsoft\Windows\DataCollection`, `...\System` (Activity History), and `HKCU\...\AdvertisingInfo`.
 
 ## GUI Actions
 
@@ -116,8 +149,9 @@ The interval is clamped between 2 seconds and 3600 seconds.
 | **Task audit** | Displays the curated scheduled task list and current state |
 | **Drift report** | Compares the current scan to the previous baseline, then updates the baseline |
 | **Task health** | Shows whether the logon monitor task is installed, enabled, elevated, and pointing to this script |
-| **Restore latest** | Imports the newest registry backup and restores manifest-backed service/task state where possible |
+| **Restore latest** | Imports the newest registry backup and restores manifest-backed service startup types, recovery actions (when stored), and task enablement |
 | **Environment** | Shows Windows, PowerShell, path, log, and admin context for support and compatibility checks |
+| **Uninstall all** | Removes `FinalEclipse-Monitor`, stops the monitor, optionally deletes `%ProgramData%\FinalEclipse` data; does not re-enable telemetry |
 
 ## Live Monitor
 
@@ -177,15 +211,30 @@ Backups are written to timestamped folders:
 
 Each backup includes registry exports, `snapshot.txt`, and `manifest.json`. The
 manifest records the app versioned backup format, script path, environment,
-watched service startup state, service recovery query output, known telemetry task
-state, and registry export results.
+watched service startup state, service recovery query output (`sc.exe qfailure`
+text in each `Services[].FailureConfig` entry), known telemetry task state, and
+registry export results.
 
 `Full harden` stops before making destructive changes if the backup step is
 incomplete. Use `-RestoreLatestBackup` or **Restore latest** to import the newest
-`.reg` files from the backup folder. When `manifest.json` is present, restore also
-attempts to reapply captured service startup types and scheduled task enabled
-states. It does not fully reconstruct deleted cache folders or service recovery
-actions.
+`.reg` files from the backup folder (SHA-256 bound via the manifest). When
+`manifest.json` is present, restore also attempts to reapply:
+
+- Captured service startup types
+- Service recovery actions parsed from stored `FailureConfig` / `sc.exe qfailure` text
+- Scheduled task enabled/disabled states for the curated list
+
+### Restore limits
+
+- If `FailureConfig` is missing, empty, or unparseable (older backups or failed
+  `qfailure` capture), recovery actions are **not** rebuilt; only startup type is
+  restored for that service. Create a new backup with this version to capture
+  recovery for future restores.
+- Deleted IrisService registry trees and ConnectedDevicesPlatform folder contents
+  are not reconstructed from the backup (only registry `.reg` exports that were
+  successfully hashed into the manifest are imported).
+- Missing services or tasks on the current machine soft-fail with log lines and do
+  not abort the rest of restore.
 
 Monitor logs are written here:
 
@@ -227,6 +276,16 @@ Examples of data outside this tool's scope include:
 - Browser and app fingerprints
 - `MachineGuid`
 - Account identifiers
+
+### Out-of-scope note (GUI and elsewhere)
+
+The GUI **Scan** view may display `MachineGuid` and other related IDs for
+operator awareness. Displaying a value does **not** mean FinalEclipse wipes or
+rotates it. `MachineGuid`, server-side GDID/account history, and similar
+identifiers are intentionally out of scope: they are not cleared by Full harden,
+Wipe local PUID, Clear caches, or the live monitor. Do not treat a scan field as
+an action target unless the corresponding button or CLI switch documents that
+change.
 
 Some Microsoft account and device experiences may re-register local identifiers if
 the monitor is stopped or if related Windows components are re-enabled later.
@@ -299,3 +358,7 @@ and signs the manifest.
 Use FinalEclipse only on machines you own or are authorized to administer. Make a
 backup before hardening, review the scan output before sharing screenshots, and
 expect Windows updates or account changes to require another scan.
+
+## Windows installer
+
+See [Windows installer and signature verification](docs/WINDOWS_INSTALLER.md) for the download path and verification steps.

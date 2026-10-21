@@ -4,6 +4,8 @@ param(
     [int]$IntervalSeconds = 5,
     [switch]$InstallTask,
     [switch]$UninstallTask,
+    [switch]$UninstallAll,
+    [switch]$RemoveAppData,
     [switch]$AdvancedHarden,
     [switch]$DriftReport,
     [switch]$TaskHealth,
@@ -21,12 +23,14 @@ function Test-IsAdmin {
 }
 
 if (-not (Test-IsAdmin)) {
-    $isCliMode = $Monitor -or $InstallTask -or $UninstallTask -or $AdvancedHarden -or
+    $isCliMode = $Monitor -or $InstallTask -or $UninstallTask -or $UninstallAll -or $AdvancedHarden -or
         $DriftReport -or $TaskHealth -or $RestoreLatestBackup
     $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"")
     if ($Monitor)         { $argList += '-Monitor' }
     if ($InstallTask)     { $argList += '-InstallTask' }
     if ($UninstallTask)   { $argList += '-UninstallTask' }
+    if ($UninstallAll)    { $argList += '-UninstallAll' }
+    if ($RemoveAppData)   { $argList += '-RemoveAppData' }
     if ($AdvancedHarden)  { $argList += '-AdvancedHarden' }
     if ($DriftReport)     { $argList += '-DriftReport' }
     if ($TaskHealth)      { $argList += '-TaskHealth' }
@@ -442,21 +446,136 @@ function Get-ServiceBackupState {
     }
 }
 
+function Convert-QFailureTextToScArgs {
+    <#
+      Best-effort parse of sc.exe qfailure text into sc.exe failure arguments.
+      Returns $null when recovery data is absent or unusable.
+    #>
+    param([AllowNull()][string]$FailureConfig)
+    if ([string]::IsNullOrWhiteSpace($FailureConfig)) { return $null }
+    if ($FailureConfig -match '(?i)^Unavailable:') { return $null }
+    if ($FailureConfig -notmatch '(?i)RESET_PERIOD|FAILURE_ACTIONS|SERVICE_NAME') { return $null }
+
+    $reset = 0
+    $m = [regex]::Match($FailureConfig, 'RESET_PERIOD\s*\(in seconds\)\s*:\s*(\d+)', 'IgnoreCase')
+    if ($m.Success) { $reset = [int]$m.Groups[1].Value }
+
+    $reboot = ''
+    $m = [regex]::Match($FailureConfig, 'REBOOT_MESSAGE\s*:\s*(.*)$', 'IgnoreCase, Multiline')
+    if ($m.Success) { $reboot = $m.Groups[1].Value.Trim() }
+
+    $command = ''
+    $m = [regex]::Match($FailureConfig, 'COMMAND_LINE\s*:\s*(.*)$', 'IgnoreCase, Multiline')
+    if ($m.Success) { $command = $m.Groups[1].Value.Trim() }
+
+    $actions = New-Object System.Collections.Generic.List[string]
+    $actionMatches = [regex]::Matches(
+        $FailureConfig,
+        '(RESTART|RUN\s+PROCESS|REBOOT|TAKE\s+NO\s+ACTION|NONE)\s*(?:--\s*Delay\s*=\s*(\d+)\s*milliseconds)?',
+        'IgnoreCase'
+    )
+    foreach ($am in $actionMatches) {
+        $kind = ($am.Groups[1].Value -replace '\s+', ' ').ToUpperInvariant()
+        $delay = if ($am.Groups[2].Success -and -not [string]::IsNullOrWhiteSpace($am.Groups[2].Value)) {
+            $am.Groups[2].Value
+        } else {
+            '0'
+        }
+        switch -Regex ($kind) {
+            '^RESTART$' { [void]$actions.Add("restart/$delay") }
+            '^RUN PROCESS$' { [void]$actions.Add("run/$delay") }
+            '^REBOOT$' { [void]$actions.Add("reboot/$delay") }
+            # Take-no-action slots are omitted; empty actions= clears recovery when none remain.
+            '^(TAKE NO ACTION|NONE)$' { }
+        }
+        if ($actions.Count -ge 3) { break }
+    }
+
+    return [pscustomobject]@{
+        Reset = $reset
+        Reboot = $reboot
+        Command = $command
+        Actions = @($actions)
+        HasActions = ($actions.Count -gt 0)
+    }
+}
+
+function Restore-ServiceFailureConfig {
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [AllowNull()][string]$FailureConfig
+    )
+    $parsed = Convert-QFailureTextToScArgs -FailureConfig $FailureConfig
+    if ($null -eq $parsed) {
+        Write-AppLog "Service recovery restore skipped for ${Name}: no usable qfailure data in manifest (startup type only). Limitation: older backups or failed qfailure capture cannot rebuild recovery actions."
+        return $false
+    }
+    if ($WhatIfPreference) {
+        $actPreview = if ($parsed.HasActions) { ($parsed.Actions -join '/') } else { '(clear/none)' }
+        Write-AppLog "WhatIf: would restore service recovery for $Name (reset=$($parsed.Reset), actions=$actPreview)"
+        return $true
+    }
+    try {
+        $argList = [System.Collections.Generic.List[string]]@('failure', $Name, 'reset=', "$($parsed.Reset)")
+        if (-not [string]::IsNullOrWhiteSpace($parsed.Reboot)) {
+            [void]$argList.Add('reboot=')
+            [void]$argList.Add($parsed.Reboot)
+        }
+        if (-not [string]::IsNullOrWhiteSpace($parsed.Command)) {
+            [void]$argList.Add('command=')
+            [void]$argList.Add($parsed.Command)
+        }
+        if ($parsed.HasActions) {
+            [void]$argList.Add('actions=')
+            [void]$argList.Add(($parsed.Actions -join '/'))
+        } else {
+            [void]$argList.Add('actions=')
+            [void]$argList.Add('')
+        }
+        $r = Invoke-ExternalCommand -FilePath 'sc.exe' -Arguments @($argList)
+        if ($r.ExitCode -ne 0) {
+            Write-AppLog "Service recovery restore failed for ${Name} (exit $($r.ExitCode)): $($r.Output)" 'WARN'
+            return $false
+        }
+        Write-AppLog "Restored service recovery actions: $Name"
+        return $true
+    } catch {
+        Write-AppLog "Service recovery restore error for ${Name}: $($_.Exception.Message)" 'WARN'
+        return $false
+    }
+}
+
 function Restore-ServiceBackupState {
     param($State)
-    if ($null -eq $State -or -not $State.Installed) { return }
-    $svc = Get-Service -Name $State.Name -ErrorAction SilentlyContinue
-    if (-not $svc) { return }
+    if ($null -eq $State) { return }
+    $name = [string]$State.Name
+    if ([string]::IsNullOrWhiteSpace($name)) { return }
+    if (-not $State.Installed) {
+        Write-AppLog "Service not installed at backup time; soft-fail skip restore: $name"
+        return
+    }
+    $svc = Get-Service -Name $name -ErrorAction SilentlyContinue
+    if (-not $svc) {
+        Write-AppLog "Service not present on this system; soft-fail skip restore: $name"
+        return
+    }
     if ($WhatIfPreference) {
-        Write-AppLog "WhatIf: would restore service $($State.Name) startup type to $($State.StartType)"
+        Write-AppLog "WhatIf: would restore service $name startup type to $($State.StartType)"
+        $fc = if ($null -ne $State.PSObject.Properties['FailureConfig']) { [string]$State.FailureConfig } else { '' }
+        $null = Restore-ServiceFailureConfig -Name $name -FailureConfig $fc
         return
     }
     try {
-        Set-Service -Name $State.Name -StartupType $State.StartType -ErrorAction Stop
-        Write-AppLog "Restored service startup type: $($State.Name) -> $($State.StartType)"
+        Set-Service -Name $name -StartupType $State.StartType -ErrorAction Stop
+        Write-AppLog "Restored service startup type: $name -> $($State.StartType)"
     } catch {
-        Write-AppLog "Could not restore startup type for $($State.Name): $($_.Exception.Message)" 'WARN'
+        Write-AppLog "Could not restore startup type for ${name}: $($_.Exception.Message)" 'WARN'
     }
+    $failureConfig = ''
+    if ($null -ne $State.PSObject.Properties['FailureConfig']) {
+        $failureConfig = [string]$State.FailureConfig
+    }
+    $null = Restore-ServiceFailureConfig -Name $name -FailureConfig $failureConfig
 }
 
 function Split-TaskPath {
@@ -492,26 +611,35 @@ function Get-TaskBackupState {
 
 function Restore-TaskBackupState {
     param($State)
-    if ($null -eq $State -or -not $State.Installed) { return }
-    $parts = Split-TaskPath -FullPath $State.Path
+    if ($null -eq $State) { return }
+    $path = [string]$State.Path
+    if ([string]::IsNullOrWhiteSpace($path)) { return }
+    if (-not $State.Installed) {
+        Write-AppLog "Scheduled task not installed at backup time; soft-fail skip restore: $path"
+        return
+    }
+    $parts = Split-TaskPath -FullPath $path
     $task = Get-ScheduledTask -TaskPath $parts.TaskPath -TaskName $parts.TaskName -ErrorAction SilentlyContinue
-    if ($null -eq $task) { return }
+    if ($null -eq $task) {
+        Write-AppLog "Scheduled task not present on this system; soft-fail skip restore: $path"
+        return
+    }
     try {
         if ($State.State -eq 'Disabled') {
-            if ($WhatIfPreference) { Write-AppLog "WhatIf: would disable task $($State.Path)" }
+            if ($WhatIfPreference) { Write-AppLog "WhatIf: would disable task $path" }
             else {
                 Disable-ScheduledTask -TaskPath $parts.TaskPath -TaskName $parts.TaskName -ErrorAction Stop | Out-Null
-                Write-AppLog "Restored task disabled state: $($State.Path)"
+                Write-AppLog "Restored task disabled state: $path"
             }
         } elseif ($task.State -eq 'Disabled') {
-            if ($WhatIfPreference) { Write-AppLog "WhatIf: would enable task $($State.Path)" }
+            if ($WhatIfPreference) { Write-AppLog "WhatIf: would enable task $path" }
             else {
                 Enable-ScheduledTask -TaskPath $parts.TaskPath -TaskName $parts.TaskName -ErrorAction Stop | Out-Null
-                Write-AppLog "Restored task enabled state: $($State.Path)"
+                Write-AppLog "Restored task enabled state: $path"
             }
         }
     } catch {
-        Write-AppLog "Could not restore task $($State.Path): $($_.Exception.Message)" 'WARN'
+        Write-AppLog "Could not restore task ${path}: $($_.Exception.Message)" 'WARN'
     }
 }
 
@@ -760,7 +888,7 @@ function Format-EnvironmentReportText {
 }
 
 function Format-OperationPlanText {
-    param([ValidateSet('Wipe','Advanced','Full','Restore')]$Operation)
+    param([ValidateSet('Wipe','Advanced','Full','Restore','UninstallAll')]$Operation)
     $sb = New-Object System.Text.StringBuilder
     [void]$sb.AppendLine("=== Planned operation: $Operation ===")
     [void]$sb.AppendLine("Dry run: $(if ($WhatIfPreference) { 'ON' } else { 'off' })")
@@ -781,6 +909,7 @@ function Format-OperationPlanText {
             foreach ($t in $script:KnownTelemetryTasks) { [void]$sb.AppendLine("  $t") }
             [void]$sb.AppendLine('')
             [void]$sb.AppendLine('Will reapply Activity History, telemetry, and Advertising ID policies.')
+            [void]$sb.AppendLine('Missing services/tasks soft-fail with log lines (no hard error).')
         }
         'Full' {
             [void]$sb.AppendLine("Will create a backup under: $script:BackupRoot")
@@ -792,7 +921,20 @@ function Format-OperationPlanText {
         }
         'Restore' {
             [void]$sb.AppendLine("Will import .reg files from the newest folder under: $script:BackupRoot")
-            [void]$sb.AppendLine('When manifest.json is present, will restore captured service startup types and scheduled task enabled states.')
+            [void]$sb.AppendLine('When manifest.json is present, will restore:')
+            [void]$sb.AppendLine('  - captured service startup types')
+            [void]$sb.AppendLine('  - service recovery actions from sc.exe qfailure text (FailureConfig) when stored')
+            [void]$sb.AppendLine('  - scheduled task enabled/disabled states')
+            [void]$sb.AppendLine('Limitation: if FailureConfig was not captured, recovery actions are not rebuilt.')
+            [void]$sb.AppendLine('Does not reconstruct deleted IrisService/CDP cache folder contents.')
+        }
+        'UninstallAll' {
+            [void]$sb.AppendLine("Will remove scheduled task: $script:TaskName (soft-fail if absent).")
+            [void]$sb.AppendLine('Will stop any running FinalEclipse monitor process for this script.')
+            [void]$sb.AppendLine('Optionally removes %ProgramData%\FinalEclipse backups, logs, state, and protected script copy (with confirmation).')
+            [void]$sb.AppendLine('')
+            [void]$sb.AppendLine('Does NOT re-enable telemetry services, tasks, or privacy policies by default.')
+            [void]$sb.AppendLine('To reverse hardening: use Restore latest (if you backed up first), or manually re-enable services/tasks/policies.')
         }
     }
     return $sb.ToString()
@@ -801,7 +943,12 @@ function Format-OperationPlanText {
 function Disable-ServiceRecovery {
     param([string]$Name, [switch]$Quiet)
     $svc = Get-Service -Name $Name -ErrorAction SilentlyContinue
-    if (-not $svc) { return $false }
+    if (-not $svc) {
+        if (-not $Quiet) {
+            Write-AppLog "Service not installed; soft-fail skip recovery clear: $Name"
+        }
+        return $false
+    }
 
     $changed = $false
     if ($WhatIfPreference) {
@@ -863,7 +1010,12 @@ function Wait-ServiceStableState {
 function Disable-ServiceHard {
     param([string]$Name, [switch]$Quiet)
     $svc = Get-Service -Name $Name -ErrorAction SilentlyContinue
-    if (-not $svc) { return $false }
+    if (-not $svc) {
+        if (-not $Quiet) {
+            Write-AppLog "Service not installed; soft-fail skip disable: $Name"
+        }
+        return $false
+    }
 
     $neededStop    = ($svc.Status -ne 'Stopped' -and $svc.Status -ne 'StopPending')
     $neededDisable = ($svc.StartType -ne [System.ServiceProcess.ServiceStartMode]::Disabled)
@@ -995,6 +1147,8 @@ function Export-RegistryBackup {
                 }
             }
         }
+        # Services[].FailureConfig holds raw sc.exe qfailure output for recovery restore.
+        $serviceStates = @($serviceNames | Select-Object -Unique | ForEach-Object { Get-ServiceBackupState -Name $_ })
         $manifest = [ordered]@{
             Version = $script:BackupManifestVersion
             Created = (Get-Date).ToString('o')
@@ -1004,7 +1158,8 @@ function Export-RegistryBackup {
             ExportedRegistryFiles = @($exported | ForEach-Object { Split-Path -Leaf $_ })
             RegistryFileHashes = @($fileHashes)
             RegistryExportFailures = @($failed)
-            Services = @($serviceNames | Select-Object -Unique | ForEach-Object { Get-ServiceBackupState -Name $_ })
+            Services = $serviceStates
+            ServiceRecoveryQueryNote = 'Each Services[].FailureConfig is sc.exe qfailure text used to restore recovery actions.'
             KnownTelemetryTasks = @($script:KnownTelemetryTasks | ForEach-Object { Get-TaskBackupState -FullPath $_ })
             Environment = Get-EnvironmentReport
         }
@@ -1156,10 +1311,18 @@ function Invoke-DisableGdidPipeline {
 function Disable-KnownTelemetryTasks {
     param([switch]$Quiet)
     $changed = 0
+    $missing = 0
     foreach ($full in $script:KnownTelemetryTasks) {
         $parts = Split-TaskPath -FullPath $full
         $task = Get-ScheduledTask -TaskPath $parts.TaskPath -TaskName $parts.TaskName -ErrorAction SilentlyContinue
-        if ($null -eq $task -or $task.State -eq 'Disabled') { continue }
+        if ($null -eq $task) {
+            $missing++
+            if (-not $Quiet) {
+                Write-AppLog "Scheduled task not installed; soft-fail skip: $full"
+            }
+            continue
+        }
+        if ($task.State -eq 'Disabled') { continue }
         try {
             if ($WhatIfPreference) {
                 Write-AppLog "WhatIf: would disable known telemetry task: $full"
@@ -1173,7 +1336,7 @@ function Disable-KnownTelemetryTasks {
         }
     }
     if (-not $Quiet -and $changed -eq 0) {
-        Write-AppLog 'Known telemetry task audit found nothing enabled to disable.'
+        Write-AppLog "Known telemetry task audit found nothing enabled to disable (missing/not installed: $missing)."
     }
     return $changed
 }
@@ -1593,11 +1756,144 @@ function Uninstall-MonitorTask {
     }
     $task = Get-ScheduledTask -TaskName $script:TaskName -ErrorAction SilentlyContinue
     if ($null -eq $task) {
-        Write-AppLog "Scheduled task '$($script:TaskName)' was not installed."
+        Write-AppLog "Scheduled task '$($script:TaskName)' was not installed; soft-fail skip unregister."
         return
     }
-    Unregister-ScheduledTask -TaskName $script:TaskName -Confirm:$false -ErrorAction Stop
-    Write-AppLog "Scheduled task '$($script:TaskName)' removed."
+    try {
+        Unregister-ScheduledTask -TaskName $script:TaskName -Confirm:$false -ErrorAction Stop
+        Write-AppLog "Scheduled task '$($script:TaskName)' removed."
+        Write-AuditEvent -Event 'task-uninstalled' -Message "Monitor task removed" -Target $script:TaskName
+    } catch {
+        Write-AppLog "Could not remove scheduled task '$($script:TaskName)': $($_.Exception.Message)" 'WARN'
+    }
+}
+
+function Stop-FinalEclipseMonitorProcesses {
+    param([switch]$Quiet)
+    $stopped = 0
+    try {
+        $pattern = 'FinalEclipse\.ps1'
+        $procs = @(Get-CimInstance -ClassName Win32_Process -ErrorAction SilentlyContinue |
+            Where-Object {
+                $cmd = [string]$_.CommandLine
+                $cmd -match $pattern -and $cmd -match '(?i)-Monitor\b' -and
+                    $_.ProcessId -ne $PID
+            })
+        foreach ($proc in $procs) {
+            try {
+                if ($WhatIfPreference) {
+                    Write-AppLog "WhatIf: would stop monitor process PID $($proc.ProcessId)"
+                    $stopped++
+                    continue
+                }
+                Stop-Process -Id $proc.ProcessId -Force -ErrorAction Stop
+                Write-AppLog "Stopped FinalEclipse monitor process PID $($proc.ProcessId)"
+                $stopped++
+            } catch {
+                Write-AppLog "Could not stop monitor PID $($proc.ProcessId): $($_.Exception.Message)" 'WARN'
+            }
+        }
+    } catch {
+        Write-AppLog "Monitor process scan failed: $($_.Exception.Message)" 'WARN'
+    }
+    if ($stopped -eq 0 -and -not $Quiet) {
+        Write-AppLog 'No running FinalEclipse monitor process found; soft-fail skip stop.'
+    }
+    return $stopped
+}
+
+function Remove-FinalEclipseAppData {
+    param([switch]$IncludeProtectedScript)
+    $roots = @(
+        $script:BackupRoot,
+        $script:LogDir,
+        $script:StateDir
+    )
+    $appRoot = Join-Path $env:ProgramData 'FinalEclipse'
+    if ($WhatIfPreference) {
+        Write-AppLog "WhatIf: would remove FinalEclipse app data under $appRoot (Backups/Logs/State$(if ($IncludeProtectedScript) { ', protected script' }))"
+        return
+    }
+    foreach ($path in $roots) {
+        if (Test-Path -LiteralPath $path) {
+            try {
+                Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction Stop
+                Write-AppLog "Removed: $path"
+            } catch {
+                Write-AppLog "Could not remove ${path}: $($_.Exception.Message)" 'WARN'
+            }
+        } else {
+            Write-AppLog "Path already absent; soft-fail skip: $path"
+        }
+    }
+    if ($IncludeProtectedScript) {
+        $protected = Get-ProtectedScriptInstallPath
+        if (Test-Path -LiteralPath $protected) {
+            try {
+                Remove-Item -LiteralPath $protected -Force -ErrorAction Stop
+                Write-AppLog "Removed protected script: $protected"
+            } catch {
+                Write-AppLog "Could not remove protected script: $($_.Exception.Message)" 'WARN'
+            }
+        }
+    }
+    # Remove empty app root if nothing remains.
+    if ((Test-Path -LiteralPath $appRoot) -and -not (Get-ChildItem -LiteralPath $appRoot -Force -ErrorAction SilentlyContinue)) {
+        try {
+            Remove-Item -LiteralPath $appRoot -Force -ErrorAction Stop
+            Write-AppLog "Removed empty app root: $appRoot"
+        } catch { }
+    }
+}
+
+function Invoke-UninstallAll {
+    <#
+      Removes FinalEclipse-Monitor logon task, stops the live monitor, and
+      optionally deletes %ProgramData%\FinalEclipse backups/logs/state.
+      Does not re-enable telemetry services, tasks, or policies.
+    #>
+    param(
+        [switch]$RemoveData,
+        [switch]$SkipDataPrompt
+    )
+    Write-AppLog 'Uninstall all: removing monitor task and stopping monitor...'
+    Uninstall-MonitorTask
+    $null = Stop-FinalEclipseMonitorProcesses
+
+    $doRemove = [bool]$RemoveData
+    if (-not $SkipDataPrompt -and -not $RemoveData -and -not $WhatIfPreference) {
+        # CLI interactive confirm when -RemoveAppData was not passed.
+        try {
+            $answer = Read-Host 'Also remove %ProgramData%\FinalEclipse backups, logs, state, and protected script? [y/N]'
+            if ($answer -match '^(y|yes)$') { $doRemove = $true }
+        } catch {
+            Write-AppLog 'Non-interactive host; leaving ProgramData in place (pass -RemoveAppData to delete).'
+            $doRemove = $false
+        }
+    }
+
+    if ($doRemove) {
+        Write-AppLog 'Removing FinalEclipse ProgramData (backups/logs/state/protected script)...'
+        Remove-FinalEclipseAppData -IncludeProtectedScript
+        Write-AuditEvent -Event 'uninstall-all' -Message 'Uninstall all completed with app data removal' -Target (Join-Path $env:ProgramData 'FinalEclipse') -Data @{
+            removeData = $true
+        }
+    } else {
+        Write-AppLog 'Left %ProgramData%\FinalEclipse backups/logs/state in place.'
+        Write-AuditEvent -Event 'uninstall-all' -Message 'Uninstall all completed (task/monitor only)' -Target $script:TaskName -Data @{
+            removeData = $false
+        }
+    }
+
+    Write-AppLog 'Uninstall all complete. Telemetry services/tasks/policies were NOT re-enabled.'
+    Write-AppLog 'To reverse hardening: Restore latest backup (if created before harden), or manually re-enable services (e.g. DiagTrack), known telemetry tasks, and clear/adjust privacy policies under DataCollection/System/AdvertisingInfo.'
+}
+
+if ($UninstallAll) {
+    Ensure-AppDirs
+    $script:SuppressUiLog = $true
+    Invoke-UninstallAll -RemoveData:$RemoveAppData -SkipDataPrompt:$RemoveAppData
+    exit 0
 }
 
 if ($UninstallTask) {
@@ -1771,7 +2067,7 @@ function Invoke-GuiAction {
 
 function Confirm-GuiOperation {
     param(
-        [Parameter(Mandatory)][ValidateSet('Wipe','Advanced','Full','Restore')]$Operation,
+        [Parameter(Mandatory)][ValidateSet('Wipe','Advanced','Full','Restore','UninstallAll')]$Operation,
         [Parameter(Mandatory)][string]$Title
     )
     $oldWhatIf = $WhatIfPreference
@@ -1978,12 +2274,55 @@ $btnEnvironment = New-ActionButton -Text 'Environment' -X 486 -Y 416 -W 150 -OnC
     }
 }
 
+$btnUninstallAll = New-ActionButton -Text 'Uninstall all' -X 644 -Y 416 -W 140 -OnClick {
+    if (-not (Confirm-GuiOperation -Operation UninstallAll -Title 'Uninstall all')) { return }
+    $removeData = $false
+    if (-not $chkDryRun.Checked) {
+        $dataChoice = [System.Windows.Forms.MessageBox]::Show(
+            "Also remove %ProgramData%\FinalEclipse backups, logs, state, and protected script copy?`r`n`r`nYes = delete app data`r`nNo = keep app data (task/monitor only)`r`nCancel = abort",
+            'Remove FinalEclipse data?',
+            'YesNoCancel',
+            'Warning')
+        if ($dataChoice -eq 'Cancel') { return }
+        $removeData = ($dataChoice -eq 'Yes')
+    }
+    try {
+        # Stop GUI-owned monitor first so we do not leave a zombie child.
+        $watchTimer.Stop()
+        if ($null -ne $script:MonitorProcess -and -not $script:MonitorProcess.HasExited) {
+            try {
+                $script:MonitorProcess.Kill()
+                $script:MonitorProcess.WaitForExit(3000) | Out-Null
+            } catch {
+                Write-AppLog "Could not stop owned monitor process: $($_.Exception.Message)" 'WARN'
+            }
+        }
+        if ($null -ne $script:MonitorProcess) {
+            try { $script:MonitorProcess.Dispose() } catch { }
+            $script:MonitorProcess = $null
+        }
+        $script:MonitorRunning = $false
+        Update-MonitorStatusUi
+
+        Invoke-GuiAction {
+            Invoke-UninstallAll -RemoveData:$removeData -SkipDataPrompt
+        } -RefreshAfter
+        [System.Windows.Forms.MessageBox]::Show(
+            "Uninstall all finished.`r`nTelemetry was not re-enabled. Use Restore latest (if you have a backup) to reverse service/task state.",
+            'Uninstall all',
+            'OK',
+            'Information') | Out-Null
+    } catch {
+        Write-AppLog "Uninstall all failed: $($_.Exception.Message)" 'ERROR'
+    }
+}
+
 $form.Controls.AddRange(@(
     $lblHeader, $txtSnap, $lblStatus, $chkDryRun, $lblLog, $script:txtLog,
     $btnScan, $btnBackup, $btnDisable, $btnClear, $btnWipe, $btnFull,
     $btnStartMon, $btnStopMon, $btnInstallTask, $btnRemoveTask,
     $btnAdvanced, $btnTaskAudit, $btnDrift, $btnTaskHealth,
-    $btnRestore, $btnEnvironment
+    $btnRestore, $btnEnvironment, $btnUninstallAll
 ))
 
 $form.Add_FormClosing({
