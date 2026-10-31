@@ -216,7 +216,9 @@ text in each `Services[].FailureConfig` entry), known telemetry task state, and
 registry export results.
 
 `Full harden` stops before making destructive changes if the backup step is
-incomplete. Use `-RestoreLatestBackup` or **Restore latest** to import the newest
+incomplete. A backup must contain at least one successfully exported and
+SHA-256-hashed registry file; if every configured registry source is absent, the
+operation is incomplete and Full harden stops. Use `-RestoreLatestBackup` or **Restore latest** to import the newest
 `.reg` files from the backup folder (SHA-256 bound via the manifest). When
 `manifest.json` is present, restore also attempts to reapply:
 
@@ -235,6 +237,13 @@ incomplete. Use `-RestoreLatestBackup` or **Restore latest** to import the newes
   successfully hashed into the manifest are imported).
 - Missing services or tasks on the current machine soft-fail with log lines and do
   not abort the rest of restore.
+- Restore audit events include a success, partial, or dry-run status. If any
+  registry import or service/task restoration fails, the operation reports the
+  failure and exits unsuccessfully after recording the completed items.
+
+Installing the elevated monitor task protects the app directory, task payload,
+and installed-script hash with SYSTEM/Administrators-only ACLs. Installation stops
+if those ACLs cannot be applied and verified.
 
 Monitor logs are written here:
 
@@ -253,14 +262,20 @@ the five most recent rotated logs.
 
 ## Release Checks
 
-Run the release checks before signing:
+Run the release checks, then regenerate the signatures and checksum manifest before
+publishing:
 
 ```powershell
 .\Test-Release.ps1
+ISCC.exe .\installer\FinalEclipse.iss
+.\Sign-Release.ps1
 ```
 
 The check script validates PowerShell syntax, verifies expected safety markers,
-and runs the optional Pester suite when Pester is installed.
+and runs the optional Pester suite when Pester is installed. Signing uses the
+private key in `.gnupg-release`; keep that directory private. After signing, verify
+the detached signatures and compare every published asset with `docs/SHA256SUMS`.
+Do not publish if a signature or checksum verification fails.
 
 ## Important Limits
 
@@ -323,14 +338,20 @@ gpg --verify Test-Release.ps1.asc Test-Release.ps1
 gpg --verify Tests/FinalEclipse.Static.Tests.ps1.asc Tests/FinalEclipse.Static.Tests.ps1
 gpg --verify README.md.asc README.md
 gpg --verify docs/GITHUB_RELEASE.md.asc docs/GITHUB_RELEASE.md
+gpg --verify docs/WINDOWS_INSTALLER.md.asc docs/WINDOWS_INSTALLER.md
 gpg --verify docs/SHA256SUMS.asc docs/SHA256SUMS
+gpg --verify release/windows/FinalEclipse-Setup-1.0.1.exe.asc release/windows/FinalEclipse-Setup-1.0.1.exe
+gpg --verify release/windows/SHA256SUMS.asc release/windows/SHA256SUMS
 ```
 
-You can also compare file hashes against:
+Compare source and documentation hashes against:
 
 ```text
 docs/SHA256SUMS
 ```
+
+The optional Windows installer uses its own signed manifest at
+`release/windows/SHA256SUMS`.
 
 ## Re-Signing A Local Release
 
@@ -348,10 +369,10 @@ To recreate signatures and checksums:
 .\Sign-Release.ps1
 ```
 
-The script signs `FinalEclipse.ps1`, `FinalEclipse.bat`, `Test-Release.ps1`,
-`Tests/FinalEclipse.Static.Tests.ps1`, `README.md`, and
-`docs/GITHUB_RELEASE.md`, exports the public key, rebuilds `docs/SHA256SUMS`,
-and signs the manifest.
+The script signs the application scripts, tests, and release documentation,
+exports the public key, rebuilds `docs/SHA256SUMS`, then signs the installer
+matching `MyAppVersion` in `installer/FinalEclipse.iss` and rebuilds
+`release/windows/SHA256SUMS`. Build the installer first.
 
 ## Responsible Use
 
@@ -362,3 +383,5 @@ expect Windows updates or account changes to require another scan.
 ## Windows installer
 
 See [Windows installer and signature verification](docs/WINDOWS_INSTALLER.md) for the download path and verification steps.
+The current installer is built from the latest source as version 1.0.1. The older
+1.0.0 installer remains as a historical artifact.
