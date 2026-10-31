@@ -25,6 +25,14 @@ that show when local identity traces or persistence settings reappear.
 - Added `Test-Release.ps1` and optional Pester static checks.
 - Added **Drift report** baseline comparison under
   `%ProgramData%\FinalEclipse\State\last-snapshot.json`.
+- Require at least one exported and SHA-256-hashed registry file before Full
+  harden proceeds.
+- Validate every backup registry hash before restoring any registry file, and
+  audit partial restore failures.
+- Protect the elevated monitor payload and its hash with verified SYSTEM and
+  Administrators-only ACLs.
+- Added regression checks for backup completeness, ACL protection, and restore
+  outcome reporting.
 - Extended `Full harden` to include the advanced hardening pass.
 - Extended the live monitor to periodically re-clear watched service recovery
   actions.
@@ -45,9 +53,18 @@ Upload these files to the GitHub release:
 - `Tests/FinalEclipse.Static.Tests.ps1.asc`
 - `README.md`
 - `README.md.asc`
+- `docs/WINDOWS_INSTALLER.md`
+- `docs/WINDOWS_INSTALLER.md.asc`
 - `docs/FinalEclipse_Release_Signing_2026_pubkey.asc`
 - `docs/SHA256SUMS`
 - `docs/SHA256SUMS.asc`
+- `release/windows/FinalEclipse-Setup-1.0.1.exe`
+- `release/windows/FinalEclipse-Setup-1.0.1.exe.asc`
+- `release/windows/SHA256SUMS`
+- `release/windows/SHA256SUMS.asc`
+
+Build and sign `FinalEclipse-Setup-1.0.1.exe` from the current source before
+publishing the installer assets.
 
 ## Verification
 
@@ -59,8 +76,14 @@ gpg --verify FinalEclipse.bat.asc FinalEclipse.bat
 gpg --verify Test-Release.ps1.asc Test-Release.ps1
 gpg --verify Tests/FinalEclipse.Static.Tests.ps1.asc Tests/FinalEclipse.Static.Tests.ps1
 gpg --verify README.md.asc README.md
+gpg --verify docs/WINDOWS_INSTALLER.md.asc docs/WINDOWS_INSTALLER.md
 gpg --verify docs/SHA256SUMS.asc docs/SHA256SUMS
+gpg --verify release/windows/FinalEclipse-Setup-1.0.1.exe.asc release/windows/FinalEclipse-Setup-1.0.1.exe
+gpg --verify release/windows/SHA256SUMS.asc release/windows/SHA256SUMS
 ```
+
+`docs/SHA256SUMS` covers the source and documentation assets. The Windows
+installer and its release manifest are covered by `release/windows/SHA256SUMS`.
 
 Expected fingerprint:
 
@@ -74,9 +97,12 @@ Encryption subkey: 64A6 668A 61F5 760A BB0D 1E1B 88DB E7EE 626F 9545
 
 - Run PowerShell parser check on `FinalEclipse.ps1`.
 - Run `.\Test-Release.ps1` from the project root.
+- Compile the current version with `ISCC.exe .\installer\FinalEclipse.iss`.
 - Run `.\Sign-Release.ps1` from the project root.
 - Verify detached signatures from `.gnupg-release`.
 - Verify every entry in `docs/SHA256SUMS`.
+- Verify the current installer entry in `release/windows/SHA256SUMS` and its
+  detached signature before publishing it.
 - Confirm `.gnupg-release\` is not uploaded or committed.
 - Confirm the GitHub release assets match `docs/SHA256SUMS`.
 
