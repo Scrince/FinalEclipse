@@ -179,7 +179,7 @@ function Invoke-WithNamedMutex {
 
 function Write-LogInfraFailure {
     param([Parameter(Mandatory)][string]$Message)
-    # Non-recursive fallback: never call Write-AppLog/Add-LogLine here.
+
     try {
         $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
         $line = "[$ts] [WARN] log-infra: $Message"
@@ -447,10 +447,10 @@ function Get-ServiceBackupState {
 }
 
 function Convert-QFailureTextToScArgs {
-    <#
-      Best-effort parse of sc.exe qfailure text into sc.exe failure arguments.
-      Returns $null when recovery data is absent or unusable.
-    #>
+
+
+
+
     param([AllowNull()][string]$FailureConfig)
     if ([string]::IsNullOrWhiteSpace($FailureConfig)) { return $null }
     if ($FailureConfig -match '(?i)^Unavailable:') { return $null }
@@ -485,7 +485,7 @@ function Convert-QFailureTextToScArgs {
             '^RESTART$' { [void]$actions.Add("restart/$delay") }
             '^RUN PROCESS$' { [void]$actions.Add("run/$delay") }
             '^REBOOT$' { [void]$actions.Add("reboot/$delay") }
-            # Take-no-action slots are omitted; empty actions= clears recovery when none remain.
+
             '^(TAKE NO ACTION|NONE)$' { }
         }
         if ($actions.Count -ge 3) { break }
@@ -547,35 +547,39 @@ function Restore-ServiceFailureConfig {
 
 function Restore-ServiceBackupState {
     param($State)
-    if ($null -eq $State) { return }
+    if ($null -eq $State) { return $true }
     $name = [string]$State.Name
-    if ([string]::IsNullOrWhiteSpace($name)) { return }
+    if ([string]::IsNullOrWhiteSpace($name)) { return $true }
     if (-not $State.Installed) {
         Write-AppLog "Service not installed at backup time; soft-fail skip restore: $name"
-        return
+        return $true
     }
     $svc = Get-Service -Name $name -ErrorAction SilentlyContinue
     if (-not $svc) {
         Write-AppLog "Service not present on this system; soft-fail skip restore: $name"
-        return
+        return $true
     }
     if ($WhatIfPreference) {
         Write-AppLog "WhatIf: would restore service $name startup type to $($State.StartType)"
         $fc = if ($null -ne $State.PSObject.Properties['FailureConfig']) { [string]$State.FailureConfig } else { '' }
-        $null = Restore-ServiceFailureConfig -Name $name -FailureConfig $fc
-        return
+        return (Restore-ServiceFailureConfig -Name $name -FailureConfig $fc)
     }
+    $success = $true
     try {
         Set-Service -Name $name -StartupType $State.StartType -ErrorAction Stop
         Write-AppLog "Restored service startup type: $name -> $($State.StartType)"
     } catch {
         Write-AppLog "Could not restore startup type for ${name}: $($_.Exception.Message)" 'WARN'
+        $success = $false
     }
     $failureConfig = ''
     if ($null -ne $State.PSObject.Properties['FailureConfig']) {
         $failureConfig = [string]$State.FailureConfig
     }
-    $null = Restore-ServiceFailureConfig -Name $name -FailureConfig $failureConfig
+    if (-not (Restore-ServiceFailureConfig -Name $name -FailureConfig $failureConfig)) {
+        $success = $false
+    }
+    return $success
 }
 
 function Split-TaskPath {
@@ -611,18 +615,18 @@ function Get-TaskBackupState {
 
 function Restore-TaskBackupState {
     param($State)
-    if ($null -eq $State) { return }
+    if ($null -eq $State) { return $true }
     $path = [string]$State.Path
-    if ([string]::IsNullOrWhiteSpace($path)) { return }
+    if ([string]::IsNullOrWhiteSpace($path)) { return $true }
     if (-not $State.Installed) {
         Write-AppLog "Scheduled task not installed at backup time; soft-fail skip restore: $path"
-        return
+        return $true
     }
     $parts = Split-TaskPath -FullPath $path
     $task = Get-ScheduledTask -TaskPath $parts.TaskPath -TaskName $parts.TaskName -ErrorAction SilentlyContinue
     if ($null -eq $task) {
         Write-AppLog "Scheduled task not present on this system; soft-fail skip restore: $path"
-        return
+        return $true
     }
     try {
         if ($State.State -eq 'Disabled') {
@@ -640,7 +644,9 @@ function Restore-TaskBackupState {
         }
     } catch {
         Write-AppLog "Could not restore task ${path}: $($_.Exception.Message)" 'WARN'
+        return $false
     }
+    return $true
 }
 
 function Get-KnownTelemetryTaskState {
@@ -1095,6 +1101,7 @@ function Export-RegistryBackup {
     New-Item -ItemType Directory -Path $dir -Force | Out-Null
     $failed = @()
     $exported = @()
+    $fileHashes = @()
 
     $exports = @(
         @{ File = 'IdentityCRL.reg'; Path = 'HKCU\SOFTWARE\Microsoft\IdentityCRL' },
@@ -1124,6 +1131,11 @@ function Export-RegistryBackup {
         }
     }
 
+
+    if ($exported.Count -eq 0) {
+        $failed += 'No registry sources were exported'
+    }
+
     $snap = Get-GdidSnapshot
     $snapPath = Join-Path $dir 'snapshot.txt'
     try {
@@ -1137,7 +1149,6 @@ function Export-RegistryBackup {
     try {
         $serviceNames = @($script:WatchedServiceNames)
         $serviceNames += @(Get-Service -Name 'CDPUserSvc*' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name)
-        $fileHashes = @()
         foreach ($expPath in $exported) {
             if (Test-Path -LiteralPath $expPath) {
                 $hash = (Get-FileHash -LiteralPath $expPath -Algorithm SHA256).Hash
@@ -1145,9 +1156,11 @@ function Export-RegistryBackup {
                     File = Split-Path -Leaf $expPath
                     Sha256 = $hash
                 }
+            } else {
+                $failed += "Exported registry file missing: $(Split-Path -Leaf $expPath)"
             }
         }
-        # Services[].FailureConfig holds raw sc.exe qfailure output for recovery restore.
+
         $serviceStates = @($serviceNames | Select-Object -Unique | ForEach-Object { Get-ServiceBackupState -Name $_ })
         $manifest = [ordered]@{
             Version = $script:BackupManifestVersion
@@ -1167,7 +1180,7 @@ function Export-RegistryBackup {
             Set-Content -LiteralPath $manifestPath -Encoding UTF8 -ErrorAction Stop
         Write-AppLog "Backup manifest written: $manifestPath"
         Write-AuditEvent -Event 'backup-created' -Message "Backup created: $dir" -Target $dir -Data @{
-            success = ($failed.Count -eq 0)
+            success = ($failed.Count -eq 0 -and $fileHashes.Count -gt 0)
             exported = @($exported)
             failed = @($failed)
             manifest = $manifestPath
@@ -1178,8 +1191,9 @@ function Export-RegistryBackup {
     }
     return [pscustomobject]@{
         Path = $dir
-        Success = ($failed.Count -eq 0)
+        Success = ($failed.Count -eq 0 -and $fileHashes.Count -gt 0)
         Exported = $exported
+        Hashed = @($fileHashes | ForEach-Object { $_.File })
         Failed = $failed
     }
 }
@@ -1202,7 +1216,7 @@ function Restore-LatestRegistryBackup {
         throw "Refusing restore: cannot parse manifest.json: $($_.Exception.Message)"
     }
 
-    # Build allowlist: prefer RegistryFileHashes (SHA-256 bound); fall back to ExportedRegistryFiles only with hash verification when available.
+
     $allowed = @{}
     if ($null -ne $manifest.RegistryFileHashes) {
         foreach ($entry in @($manifest.RegistryFileHashes)) {
@@ -1219,10 +1233,10 @@ function Restore-LatestRegistryBackup {
             if ($name.Contains('..') -or $name.Contains('/') -or $name.Contains('\')) {
                 throw "Refusing restore: invalid manifest file name '$name'"
             }
-            $allowed[$name] = $null  # no hash in older manifests — refuse for security
+            $allowed[$name] = $null
         }
         if ($allowed.Count -gt 0 -and (@($allowed.Values | Where-Object { $_ })) -eq $null) {
-            # All null hashes => legacy manifest without integrity hashes
+
             throw "Refusing restore: manifest lacks RegistryFileHashes (create a new backup with this version first)"
         }
     } else {
@@ -1232,6 +1246,9 @@ function Restore-LatestRegistryBackup {
         throw "Refusing restore: no registry files listed in manifest"
     }
 
+
+
+    $verifiedFiles = @()
     foreach ($leaf in @($allowed.Keys)) {
         $full = Join-Path $latest.FullName $leaf
         if (-not (Test-Path -LiteralPath $full)) {
@@ -1245,30 +1262,74 @@ function Restore-LatestRegistryBackup {
         if ($actual -ne $expected) {
             throw "Refusing restore: hash mismatch for $leaf (possible tampering)"
         }
-        if ($WhatIfPreference) {
-            Write-AppLog "WhatIf: would import verified registry backup $full"
-            continue
-        }
-        $p = Start-Process -FilePath 'reg.exe' -ArgumentList @('import', $full) -Wait -PassThru -WindowStyle Hidden
-        if ($null -eq $p -or $p.ExitCode -ne 0) {
-            $code = if ($null -ne $p) { $p.ExitCode } else { 'n/a' }
-            throw "reg.exe import failed for $full (exit $code)"
-        }
-        Write-AppLog "Restored verified registry backup: $full"
+        $verifiedFiles += [pscustomobject]@{ Name = $leaf; Path = $full }
     }
 
-    try {
+    $registryRestored = @()
+    $manifestRestored = @()
+    $restoreFailures = @()
+    foreach ($verifiedFile in $verifiedFiles) {
+        $leaf = $verifiedFile.Name
+        $full = $verifiedFile.Path
+        if ($WhatIfPreference) {
+            Write-AppLog "WhatIf: would import verified registry backup $full"
+            $registryRestored += $leaf
+            continue
+        }
+        try {
+            $p = Start-Process -FilePath 'reg.exe' -ArgumentList @('import', $full) -Wait -PassThru -WindowStyle Hidden
+            if ($null -eq $p -or $p.ExitCode -ne 0) {
+                $code = if ($null -ne $p) { $p.ExitCode } else { 'n/a' }
+                throw "reg.exe import failed (exit $code)"
+            }
+            Write-AppLog "Restored verified registry backup: $full"
+            $registryRestored += $leaf
+        } catch {
+            $restoreFailures += "registry file ${leaf}: $($_.Exception.Message)"
+            Write-AppLog "Registry restore failed for ${leaf}: $($_.Exception.Message)" 'ERROR'
+        }
+    }
+
+    if (-not $WhatIfPreference) {
         foreach ($svcState in @($manifest.Services)) {
-            Restore-ServiceBackupState -State $svcState
+            $target = if ($svcState.Name) { "service $($svcState.Name)" } else { 'service state' }
+            try {
+                if (Restore-ServiceBackupState -State $svcState) {
+                    $manifestRestored += $target
+                } else {
+                    $restoreFailures += "${target}: restore operation reported failure"
+                }
+            } catch {
+                $restoreFailures += "${target}: $($_.Exception.Message)"
+                Write-AppLog "Manifest restore failed for ${target}: $($_.Exception.Message)" 'WARN'
+            }
         }
         foreach ($taskState in @($manifest.KnownTelemetryTasks)) {
-            Restore-TaskBackupState -State $taskState
+            $target = if ($taskState.FullPath) { "task $($taskState.FullPath)" } else { 'task state' }
+            try {
+                if (Restore-TaskBackupState -State $taskState) {
+                    $manifestRestored += $target
+                } else {
+                    $restoreFailures += "${target}: restore operation reported failure"
+                }
+            } catch {
+                $restoreFailures += "${target}: $($_.Exception.Message)"
+                Write-AppLog "Manifest restore failed for ${target}: $($_.Exception.Message)" 'WARN'
+            }
         }
-        Write-AppLog "Restored reversible state from manifest: $manifestPath"
-    } catch {
-        Write-AppLog "Manifest state restore failed: $($_.Exception.Message)" 'WARN'
     }
-    Write-AuditEvent -Event 'backup-restored' -Message "Restored latest backup: $($latest.FullName)" -Target $latest.FullName
+    $restoreStatus = if ($restoreFailures.Count -gt 0) { 'partial' } elseif ($WhatIfPreference) { 'dry-run' } else { 'success' }
+    $restoreMessage = "Restore $restoreStatus from backup: $($latest.FullName)"
+    Write-AppLog $restoreMessage $(if ($restoreStatus -eq 'success') { 'INFO' } else { 'WARN' })
+    Write-AuditEvent -Event "backup-restored-$restoreStatus" -Message $restoreMessage -Target $latest.FullName -Data @{
+        status = $restoreStatus
+        registryRestored = @($registryRestored)
+        manifestRestored = @($manifestRestored)
+        failures = @($restoreFailures)
+    }
+    if ($restoreFailures.Count -gt 0) {
+        throw "Restore completed with one or more failures: $($restoreFailures -join '; ')"
+    }
     return $latest.FullName
 }
 
@@ -1648,46 +1709,67 @@ function Get-ProtectedScriptInstallPath {
     return (Join-Path $env:ProgramData 'FinalEclipse\FinalEclipse.ps1')
 }
 
+function Set-ProtectedPathAcl {
+    param([Parameter(Mandatory)][string]$Path)
+    $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+    $acl.SetAccessRuleProtection($true, $false)
+    @($acl.Access) | ForEach-Object { [void]$acl.RemoveAccessRule($_) }
+    $allowedSids = @('S-1-5-18', 'S-1-5-32-544')
+    foreach ($sidValue in $allowedSids) {
+        $sid = New-Object System.Security.Principal.SecurityIdentifier -ArgumentList $sidValue
+        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+            $sid, 'FullControl', 'Allow')
+        $acl.AddAccessRule($rule)
+    }
+    Set-Acl -LiteralPath $Path -AclObject $acl -ErrorAction Stop
+
+
+    $verified = Get-Acl -LiteralPath $Path -ErrorAction Stop
+    if (-not $verified.AreAccessRulesProtected) {
+        throw "ACL inheritance is still enabled on $Path"
+    }
+    foreach ($rule in @($verified.Access)) {
+        $identitySid = $rule.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
+        if (-not $allowedSids.Contains($identitySid) -or $rule.AccessControlType -ne 'Allow' -or
+            $rule.FileSystemRights -ne [System.Security.AccessControl.FileSystemRights]::FullControl) {
+            throw "Unexpected ACL entry '$identitySid' on $Path"
+        }
+    }
+    foreach ($sidValue in $allowedSids) {
+        $found = @($verified.Access | Where-Object {
+            $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value -eq $sidValue
+        }).Count
+        if (-not $found) {
+            throw "Required ACL entry '$sidValue' is missing on $Path"
+        }
+    }
+}
+
 function Install-ProtectedScriptCopy {
-    <#
-      Copy this script into ProgramData with an Administrators/SYSTEM-only ACL
-      so a non-elevated user cannot replace the elevated task payload.
-    #>
+
+
+
+
     param([Parameter(Mandatory)][string]$SourcePath)
     Ensure-AppDirs
     $dest = Get-ProtectedScriptInstallPath
     $destDir = Split-Path -Parent $dest
+    $appRoot = Join-Path $env:ProgramData 'FinalEclipse'
     if (-not (Test-Path -LiteralPath $destDir)) {
         New-Item -ItemType Directory -Path $destDir -Force | Out-Null
     }
     Copy-Item -LiteralPath $SourcePath -Destination $dest -Force -ErrorAction Stop
 
-    # Restrict ACL: SYSTEM + Administrators full; remove inherited Everyone/Users write.
-    try {
-        $acl = Get-Acl -LiteralPath $dest
-        $acl.SetAccessRuleProtection($true, $false)
-        $rules = @(
-            (New-Object System.Security.AccessControl.FileSystemAccessRule('NT AUTHORITY\SYSTEM','FullControl','Allow')),
-            (New-Object System.Security.AccessControl.FileSystemAccessRule('BUILTIN\Administrators','FullControl','Allow'))
-        )
-        $acl.Access | ForEach-Object { [void]$acl.RemoveAccessRule($_) }
-        foreach ($r in $rules) { $acl.AddAccessRule($r) }
-        Set-Acl -LiteralPath $dest -AclObject $acl
-    } catch {
-        Write-AppLog "Could not fully lock ACL on $dest : $($_.Exception.Message)" 'WARN'
-    }
+
+    Set-ProtectedPathAcl -Path $appRoot
+    Set-ProtectedPathAcl -Path $destDir
+    Set-ProtectedPathAcl -Path $dest
 
     $hash = (Get-FileHash -LiteralPath $dest -Algorithm SHA256).Hash
     $hashPath = Join-Path $script:StateDir 'installed-script.sha256'
     Set-Content -LiteralPath $hashPath -Value $hash -Encoding ASCII -Force
-    try {
-        $hAcl = Get-Acl -LiteralPath $hashPath
-        $hAcl.SetAccessRuleProtection($true, $false)
-        $hAcl.Access | ForEach-Object { [void]$hAcl.RemoveAccessRule($_) }
-        $hAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule('NT AUTHORITY\SYSTEM','FullControl','Allow')))
-        $hAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule('BUILTIN\Administrators','FullControl','Allow')))
-        Set-Acl -LiteralPath $hashPath -AclObject $hAcl
-    } catch { }
+    Set-ProtectedPathAcl -Path $script:StateDir
+    Set-ProtectedPathAcl -Path $hashPath
     return [pscustomobject]@{ Path = $dest; Sha256 = $hash }
 }
 
@@ -1718,8 +1800,8 @@ function Install-MonitorTask {
         throw "Protected script integrity check failed after install."
     }
 
-    # Prefer ConstrainedLanguage-friendly invocation: -File under ProgramData, no Bypass when possible.
-    # Use Bypass only because some hosts strip Unrestricted; path is ACL-locked + hash-pinned.
+
+
     $action = New-ScheduledTaskAction -Execute 'powershell.exe' `
         -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptPath`" -Monitor -IntervalSeconds $IntervalSeconds"
     $trigger = New-ScheduledTaskTrigger -AtLogOn
@@ -1837,7 +1919,7 @@ function Remove-FinalEclipseAppData {
             }
         }
     }
-    # Remove empty app root if nothing remains.
+
     if ((Test-Path -LiteralPath $appRoot) -and -not (Get-ChildItem -LiteralPath $appRoot -Force -ErrorAction SilentlyContinue)) {
         try {
             Remove-Item -LiteralPath $appRoot -Force -ErrorAction Stop
@@ -1847,11 +1929,11 @@ function Remove-FinalEclipseAppData {
 }
 
 function Invoke-UninstallAll {
-    <#
-      Removes FinalEclipse-Monitor logon task, stops the live monitor, and
-      optionally deletes %ProgramData%\FinalEclipse backups/logs/state.
-      Does not re-enable telemetry services, tasks, or policies.
-    #>
+
+
+
+
+
     param(
         [switch]$RemoveData,
         [switch]$SkipDataPrompt
@@ -1862,7 +1944,7 @@ function Invoke-UninstallAll {
 
     $doRemove = [bool]$RemoveData
     if (-not $SkipDataPrompt -and -not $RemoveData -and -not $WhatIfPreference) {
-        # CLI interactive confirm when -RemoveAppData was not passed.
+
         try {
             $answer = Read-Host 'Also remove %ProgramData%\FinalEclipse backups, logs, state, and protected script? [y/N]'
             if ($answer -match '^(y|yes)$') { $doRemove = $true }
@@ -1947,7 +2029,7 @@ if ($AdvancedHarden) {
 if ($Monitor) {
     Ensure-AppDirs
     $script:SuppressUiLog = $true
-    # Integrity gate for elevated scheduled-task payload (FE-2).
+
     $protected = Get-ProtectedScriptInstallPath
     if (Test-Path -LiteralPath $protected) {
         if (-not (Test-ProtectedScriptIntegrity -ScriptPath $protected)) {
@@ -2287,7 +2369,7 @@ $btnUninstallAll = New-ActionButton -Text 'Uninstall all' -X 644 -Y 416 -W 140 -
         $removeData = ($dataChoice -eq 'Yes')
     }
     try {
-        # Stop GUI-owned monitor first so we do not leave a zombie child.
+
         $watchTimer.Stop()
         if ($null -ne $script:MonitorProcess -and -not $script:MonitorProcess.HasExited) {
             try {
