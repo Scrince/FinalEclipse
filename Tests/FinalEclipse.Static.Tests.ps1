@@ -61,6 +61,34 @@ Describe 'FinalEclipse static checks' {
         $text | Should Match 'ServiceRecoveryQueryNote'
     }
 
+    It 'fails protected task installation when the payload ACL cannot be secured' {
+        $text = Get-Content -LiteralPath $scriptPath -Raw
+        $text | Should Match 'function Set-ProtectedPathAcl'
+        $text | Should Match 'Set-ProtectedPathAcl -Path \$appRoot'
+        $text | Should Match 'Set-ProtectedPathAcl -Path \$destDir'
+        $text | Should Match 'Set-ProtectedPathAcl -Path \$dest'
+        $text | Should Match 'Set-ProtectedPathAcl -Path \$hashPath'
+        $text | Should Match 'AreAccessRulesProtected'
+    }
+
+    It 'requires at least one hashed registry export for a successful backup' {
+        $text = Get-Content -LiteralPath $scriptPath -Raw
+        $text | Should Match 'No registry sources were exported'
+        $text | Should Match 'Success = \(\$failed.Count -eq 0 -and \$fileHashes.Count -gt 0\)'
+    }
+
+    It 'records restore outcome and individual registry or manifest failures' {
+        $text = Get-Content -LiteralPath $scriptPath -Raw
+        $text | Should Match 'backup-restored-\$restoreStatus'
+        $text | Should Match 'registryRestored = @\(\$registryRestored\)'
+        $text | Should Match 'manifestRestored = @\(\$manifestRestored\)'
+        $text | Should Match 'restoreFailures \+= "registry file'
+        $text | Should Match 'restoreFailures \+= "\$\{target\}:'
+        $preflightIndex = $text.IndexOf('$verifiedFiles = @()')
+        $importIndex = $text.IndexOf("Start-Process -FilePath 'reg.exe' -ArgumentList @('import', `$full)")
+        ($preflightIndex -ge 0 -and $importIndex -gt $preflightIndex) | Should Be $true
+    }
+
     It 'soft-fails when services or tasks are missing' {
         $text = Get-Content -LiteralPath $scriptPath -Raw
         $text | Should Match 'soft-fail skip'
